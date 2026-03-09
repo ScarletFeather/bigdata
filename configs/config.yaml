@@ -1,0 +1,27 @@
+# 项目配置文件
+
+# 数据路径配置
+DATA_PATH:
+  raw: "./data/raw"
+  processed: "./data/processed"
+
+# 数据库配置（示例）
+DATABASE:
+  type: "mysql"  # mysql, postgresql, mongodb 等
+  host: "localhost"
+  port: 3306
+  database: "your_database"
+  user: "your_username"
+  password: "your_password"
+
+# 模型配置
+MODEL:
+  type: "lstm"  # lstm, xgboost, prophet, arima 等
+  test_size: 0.2
+  validation_size: 0.1
+
+# 可视化配置
+VISUALIZATION:
+  style: "seaborn"
+  figsize: [12, 6]
+  save_format: "png"
