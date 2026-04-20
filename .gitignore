@@ -51,3 +51,5 @@ Thumbs.db
 .zip
 *.gz
 *.csv
+*.png
+*.html

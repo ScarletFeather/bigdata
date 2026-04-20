@@ -57,32 +57,48 @@ class OSSDataProcessor:
                     logger.error(f"获取文件信息最终失败: {e}")
                     return None
     
-    def stream_process(self, process_callback, chunk_size_mb=100):
+    def stream_process(self, process_callback, chunk_size_mb=100, local_file=None):
         """
         流式处理数据
         Args:
             process_callback: 数据处理回调函数
             chunk_size_mb: 每次处理的数据块大小(MB)
+            local_file: 本地文件路径，如果提供则处理本地文件
         """
-        chunk_size = chunk_size_mb * 1024 * 1024  # 转换为字节
-        
-        logger.info("开始流式处理数据...")
-        
-        try:
-            # 获取文件大小
-            total_size = self.get_file_info()
+        if local_file and os.path.exists(local_file):
+            # 处理本地文件
+            logger.info(f"处理本地文件: {local_file}")
+            try:
+                import io
+                import tarfile
+                with open(local_file, 'rb') as f:
+                    tar_stream = io.BytesIO(f.read())
+                    tar_stream.seek(0)
+                    self._extract_and_process(tar_stream, process_callback)
+            except Exception as e:
+                logger.error(f"处理本地文件失败: {e}")
+                raise
+        else:
+            # 从URL下载处理
+            chunk_size = chunk_size_mb * 1024 * 1024  # 转换为字节
             
-            if total_size == 0:
-                logger.warning("无法获取文件大小，使用默认处理方式")
-                # 直接处理整个流
-                self._process_stream(process_callback)
-            else:
-                # 分块处理
-                self._process_by_chunks(total_size, chunk_size, process_callback)
+            logger.info("开始流式处理数据...")
+            
+            try:
+                # 获取文件大小
+                total_size = self.get_file_info()
                 
-        except Exception as e:
-            logger.error(f"流式处理失败: {e}")
-            raise
+                if total_size == 0:
+                    logger.warning("无法获取文件大小，使用默认处理方式")
+                    # 直接处理整个流
+                    self._process_stream(process_callback)
+                else:
+                    # 分块处理
+                    self._process_by_chunks(total_size, chunk_size, process_callback)
+                    
+            except Exception as e:
+                logger.error(f"流式处理失败: {e}")
+                raise
     
     def _process_stream(self, process_callback):
         """处理整个数据流"""
@@ -159,9 +175,15 @@ class OSSDataProcessor:
                         
                         # 根据文件类型选择处理方式
                         if member.name.endswith(('.csv', '.txt')):
-                            self._process_csv_file(tar, member, process_callback)
+                            # 处理CSV文件，如果返回False则停止处理
+                            if not self._process_csv_file(tar, member, process_callback):
+                                logger.info("停止处理所有文件")
+                                return
                         elif member.name.endswith('.json'):
-                            self._process_json_file(tar, member, process_callback)
+                            # 处理JSON文件，如果返回False则停止处理
+                            if not self._process_json_file(tar, member, process_callback):
+                                logger.info("停止处理所有文件")
+                                return
                         else:
                             logger.info(f"跳过不支持的文件类型: {member.name}")
         except tarfile.ReadError as e:
@@ -175,7 +197,7 @@ class OSSDataProcessor:
             file_obj = tar.extractfile(member)
             if file_obj is None:
                 logger.warning(f"无法提取文件: {member.name}")
-                return
+                return True
             
             # 逐块读取CSV文件
             for chunk_num, chunk in enumerate(pd.read_csv(file_obj, chunksize=10000)):
@@ -184,11 +206,17 @@ class OSSDataProcessor:
                 # 调用用户定义的处理函数
                 if process_callback:
                     try:
-                        process_callback(chunk, member.name, chunk_num)
+                        should_continue = process_callback(chunk, member.name, chunk_num)
+                        # 如果回调函数返回False，停止处理
+                        if should_continue is False:
+                            logger.info("回调函数请求停止处理")
+                            return False
                     except Exception as e:
                         logger.error(f"处理回调函数失败: {e}")
+            return True
         except Exception as e:
             logger.error(f"处理CSV文件失败: {e}")
+            return True
     
     def _process_json_file(self, tar, member, process_callback):
         """处理JSON文件"""
@@ -196,7 +224,7 @@ class OSSDataProcessor:
             file_obj = tar.extractfile(member)
             if file_obj is None:
                 logger.warning(f"无法提取文件: {member.name}")
-                return
+                return True
             
             # 逐行读取JSON文件
             for line_num, line in enumerate(file_obj):
@@ -206,11 +234,17 @@ class OSSDataProcessor:
                 # 调用用户定义的处理函数
                 if process_callback:
                     try:
-                        process_callback(line.decode('utf-8'), member.name, line_num)
+                        should_continue = process_callback(line.decode('utf-8'), member.name, line_num)
+                        # 如果回调函数返回False，停止处理
+                        if should_continue is False:
+                            logger.info("回调函数请求停止处理")
+                            return False
                     except Exception as e:
                         logger.error(f"处理回调函数失败: {e}")
+            return True
         except Exception as e:
             logger.error(f"处理JSON文件失败: {e}")
+            return True
     
     def download_partial(self, start_gb, end_gb, output_file):
         """
