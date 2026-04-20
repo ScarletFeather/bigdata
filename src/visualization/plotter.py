@@ -12,11 +12,11 @@ from datetime import datetime
 class LoadVisualizer:
     """应用负载可视化工具"""
     
-    def __init__(self, style='seaborn'):
+    def __init__(self, style='default'):
         plt.style.use(style)
         self.figsize = (14, 7)
     
-    def plot_load_trend(self, df, time_column, load_column, title='应用负载趋势图'):
+    def plot_load_trend(self, df, time_column, load_column, title='应用负载趋势图', show=False):
         """
         绘制负载趋势图
         """
@@ -28,9 +28,10 @@ class LoadVisualizer:
         plt.grid(True, alpha=0.3)
         plt.xticks(rotation=45)
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
     
-    def plot_heatmap_by_hour(self, df, time_column, load_column):
+    def plot_heatmap_by_hour(self, df, time_column, load_column, show=False):
         """
         绘制小时 - 星期热力图
         展示不同时间段和星期的负载分布
@@ -57,9 +58,10 @@ class LoadVisualizer:
         plt.ylabel('小时', fontsize=12)
         plt.xticks(ticks=range(7), labels=['一', '二', '三', '四', '五', '六', '日'])
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
     
-    def plot_distribution(self, df, column, title='数据分布'):
+    def plot_distribution(self, df, column, title='数据分布', show=False):
         """
         绘制数据分布直方图
         """
@@ -80,9 +82,10 @@ class LoadVisualizer:
         
         plt.suptitle(title, fontsize=16)
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
     
-    def plot_correlation_matrix(self, df, title='特征相关性矩阵'):
+    def plot_correlation_matrix(self, df, title='特征相关性矩阵', show=False):
         """
         绘制特征相关性矩阵
         """
@@ -105,9 +108,10 @@ class LoadVisualizer:
         
         plt.title(title, fontsize=16)
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
     
-    def plot_prediction_vs_actual(self, y_actual, y_pred, title='预测值 vs 实际值'):
+    def plot_prediction_vs_actual(self, y_actual, y_pred, title='预测值 vs 实际值', show=False):
         """
         绘制预测值与实际值对比图
         """
@@ -134,9 +138,10 @@ class LoadVisualizer:
         
         plt.suptitle(title, fontsize=16)
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
     
-    def plot_feature_importance(self, importance_df, top_n=15, title='特征重要性'):
+    def plot_feature_importance(self, importance_df, top_n=15, title='特征重要性', show=False):
         """
         绘制特征重要性图
         """
@@ -151,4 +156,5 @@ class LoadVisualizer:
         plt.xlabel('重要性', fontsize=12)
         plt.ylabel('特征', fontsize=12)
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()

@@ -1,0 +1,17 @@
+{
+  "oss_url": "http://block-traces.oss-cn-beijing.aliyuncs.com/alibaba_block_traces_2020.tar.gz",
+  "max_retries": 3,
+  "chunk_size_mb": 50,
+  "download_mode": "stream",
+  "partial_start_gb": 0,
+  "partial_end_gb": 1,
+  "output_dir": "output",
+  "cleaning": {
+    "missing_value_strategy": "median",
+    "outlier_strategy": "iqr"
+  },
+  "analysis": {
+    "time_column": "timestamp",
+    "target_column": "value"
+  }
+}
