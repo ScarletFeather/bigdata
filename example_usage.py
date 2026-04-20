@@ -3,7 +3,8 @@
 阿里云OSS大数据处理使用示例
 """
 
-from oss_data_processor import OSSDataProcessor
+from src.preprocessing.oss_data_processor import OSSDataProcessor
+from src.preprocessing.preprocessor import DataPreprocessor
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -14,22 +15,39 @@ def block_trace_analyzer(data_chunk, filename, chunk_num):
     区块链轨迹数据分析函数
     根据实际数据格式进行定制
     """
+    # 创建预处理器实例
+    preprocessor = DataPreprocessor()
     
     # 基本统计信息
     print(f"=== 处理 {filename} - 块 {chunk_num} ===")
-    print(f"数据行数: {len(data_chunk)}")
+    print(f"原始数据行数: {len(data_chunk)}")
     print(f"列名: {list(data_chunk.columns)}")
     
+    # 数据清洗
+    print("\n正在进行数据清洗...")
+    cleaned_data = preprocessor.clean_data(data_chunk)
+    print(f"清洗后数据行数: {len(cleaned_data)}")
+    
+    # 提取时间特征（如果有时间列）
+    time_cols = [col for col in cleaned_data.columns if 'time' in col.lower() or 'date' in col.lower()]
+    if time_cols:
+        print(f"发现时间列: {time_cols}")
+        try:
+            cleaned_data = preprocessor.extract_time_features(cleaned_data, time_cols[0])
+            print(f"提取时间特征后数据形状: {cleaned_data.shape}")
+        except Exception as e:
+            print(f"提取时间特征失败: {e}")
+    
     # 数据预览
-    print("数据预览:")
-    print(data_chunk.head(2))
+    print("\n清洗后数据预览:")
+    print(cleaned_data.head(2))
     
     # 基本统计分析
-    if len(data_chunk) > 0:
-        print("数值列统计:")
-        numeric_cols = data_chunk.select_dtypes(include=[np.number]).columns
+    if len(cleaned_data) > 0:
+        print("\n数值列统计:")
+        numeric_cols = cleaned_data.select_dtypes(include=[np.number]).columns
         if len(numeric_cols) > 0:
-            print(data_chunk[numeric_cols].describe())
+            print(cleaned_data[numeric_cols].describe())
     
     print("-" * 80)
 
@@ -69,6 +87,7 @@ def main():
     
     # 创建处理器
     processor = OSSDataProcessor(url)
+    preprocessor = DataPreprocessor()
     
     try:
         # 1. 获取文件信息
