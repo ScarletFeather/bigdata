@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 数据处理管道（编排器）
-集成数据下载、清洗、设备负载分析功能
+集成数据下载、清洗、设备负载分析、预测功能
 """
 
 import pandas as pd
@@ -15,6 +15,7 @@ from src.data_download.oss_data_processor import OSSDataProcessor
 from src.data_cleaning.preprocessor import DataPreprocessor
 from src.data_analysis.analyzer import DataAnalyzer
 from src.device_load_analysis import DeviceLoadAnalyzer
+from src.models.predictor import TimeSeriesPredictor
 
 # 配置日志
 logging.basicConfig(
@@ -44,6 +45,7 @@ class DataCleaningPipeline:
         self.preprocessor = None
         self.analyzer = None
         self.load_analyzer = None
+        self.predictor = None
 
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.raw_data_dir, exist_ok=True)
@@ -72,6 +74,13 @@ class DataCleaningPipeline:
                 'time_window': 60,
                 'top_n_devices': None,
                 'hotspot_threshold': 100
+            },
+            'prediction': {
+                'targets': ['iops', 'throughput_kb'],
+                'models': ['linear', 'ridge', 'ar1', 'exp_smoothing',
+                           'random_forest', 'gradient_boosting', 'trend', 'moving_avg'],
+                'n_lags': None,
+                'predict_steps': 2
             }
         }
 
@@ -95,6 +104,7 @@ class DataCleaningPipeline:
         self.preprocessor = DataPreprocessor(self.config.get('cleaning', {}))
         self.analyzer = DataAnalyzer()
         self.load_analyzer = DeviceLoadAnalyzer(self.config.get('load_analysis', {}))
+        self.predictor = TimeSeriesPredictor(self.config.get('prediction', {}))
         logger.info("组件初始化完成")
 
     def check_existing_data(self):
@@ -167,6 +177,52 @@ class DataCleaningPipeline:
         if save_dir is None:
             save_dir = os.path.join(self.output_dir, 'device_analysis')
         return self.load_analyzer.run_full_analysis(raw_df, save_dir=save_dir)
+
+    def predict_load(self, df_raw_io, save_dir=None):
+        """
+        基于原始 I/O 数据进行回归预测
+
+        Args:
+            df_raw_io: 原始 I/O 轨迹 DataFrame（来自 parse_io_traces）
+            save_dir: 可视化保存目录
+
+        Returns:
+            prediction_results: dict
+        """
+        if self.predictor is None:
+            self.predictor = TimeSeriesPredictor(self.config.get('prediction', {}))
+
+        pred_config = self.config.get('prediction', {})
+        targets = pred_config.get('targets', ['iops', 'throughput_kb'])
+        models = pred_config.get('models', None)
+        n_lags = pred_config.get('n_lags', None)
+        predict_steps = pred_config.get('predict_steps', 2)
+
+        if save_dir is None:
+            save_dir = os.path.join(self.output_dir, 'prediction')
+
+        logger.info("=" * 60)
+        logger.info(f"开始负载预测: 目标={targets}, 预测步数={predict_steps}")
+        logger.info("=" * 60)
+
+        try:
+            all_results = self.predictor.run_multi_target_prediction(
+                df_raw_io, targets=targets, model_names=models,
+                n_lags=n_lags, predict_steps=predict_steps
+            )
+
+            # 打印报告
+            self.predictor.print_report(all_results)
+
+            # 生成可视化
+            self.predictor.visualize_predictions(all_results, df_raw_io, save_dir)
+
+            logger.info(f"预测完成，结果保存至: {save_dir}")
+            return all_results
+        except Exception as e:
+            logger.error(f"预测失败: {e}")
+            return None
+
 
     def _is_io_trace_data(self, df):
         """判断数据是否为I/O轨迹数据"""
@@ -285,17 +341,29 @@ class DataCleaningPipeline:
                 logger.info(f"清洗后合并数据已保存: {output_file}")
 
             # ---- 设备负载分析 + 可视化 ----
+            ts_global = None
+            raw_combined = None
             if raw_io_traces:
                 logger.info(f"合并 {len(raw_io_traces)} 个批次的I/O轨迹数据进行负载分析...")
                 raw_combined = pd.concat(raw_io_traces, ignore_index=True)
                 load_analysis_dir = os.path.join(self.output_dir, 'device_analysis')
                 try:
                     self.load_analyzer.run_full_analysis(raw_combined, save_dir=load_analysis_dir)
+                    # 获取全局时间序列用于预测
+                    ts_global = self.load_analyzer.analysis_results.get('time_series_global')
                 except KeyError as e:
                     logger.error(f"负载分析失败，列名不匹配: {e}")
                     logger.info(f"原始数据列名: {list(raw_combined.columns)}, 类型: {[type(c).__name__ for c in raw_combined.columns]}")
                 except Exception as e:
                     logger.error(f"负载分析失败: {e}")
+
+            # ---- 负载预测 ----
+            if raw_combined is not None and len(raw_combined) >= 100:
+                try:
+                    prediction_dir = os.path.join(self.output_dir, 'prediction')
+                    self.predict_load(raw_combined, save_dir=prediction_dir)
+                except Exception as e:
+                    logger.error(f"负载预测失败: {e}")
 
             return output_file if combined_df is not None else None
 
@@ -308,11 +376,12 @@ class DataCleaningPipeline:
         运行数据清洗管道
 
         Args:
-            steps: 要运行的步骤列表 ['download', 'clean', 'analyze', 'visualize', 'load_analysis']
+            steps: 要运行的步骤列表 ['download', 'clean', 'analyze', 'visualize',
+                   'load_analysis', 'predict']
             max_batches: 最大处理批次数量，默认自动执行 auto_batches(5) 个批次
         """
         if steps is None:
-            steps = ['download', 'clean', 'analyze', 'visualize']
+            steps = ['download', 'clean', 'analyze', 'visualize', 'load_analysis', 'predict']
 
         try:
             self.initialize_components()
@@ -323,15 +392,16 @@ class DataCleaningPipeline:
                     logger.error("数据下载失败")
                     return False
 
-            if 'clean' in steps or 'analyze' in steps or 'visualize' in steps or 'load_analysis' in steps:
+            if 'clean' in steps or 'analyze' in steps or 'visualize' in steps \
+                    or 'load_analysis' in steps or 'predict' in steps:
                 output_file = self.process_data(max_batches=max_batches)
                 if output_file:
                     logger.info(f"处理完成，输出文件: {output_file}")
-                elif 'load_analysis' not in steps:
+                elif 'load_analysis' not in steps and 'predict' not in steps:
                     logger.error("数据处理失败")
                     return False
                 else:
-                    logger.info("数据处理阶段完成（仅负载分析模式）")
+                    logger.info("数据处理阶段完成（仅分析/预测模式）")
                 return True
             else:
                 logger.info("数据下载完成")
@@ -353,11 +423,16 @@ def main():
     parser.add_argument('--mode', choices=['stream', 'partial'], help='下载模式')
     parser.add_argument('--output', help='输出目录')
     parser.add_argument('--steps', nargs='+',
-                        choices=['download', 'clean', 'analyze', 'visualize', 'load_analysis'],
+                        choices=['download', 'clean', 'analyze', 'visualize',
+                                 'load_analysis', 'predict'],
                         help='要运行的步骤列表')
     parser.add_argument('--max-batches', type=int, help='最大处理批次数量')
     parser.add_argument('--auto-batches', type=int,
                         help=f'自动执行的批次数（默认{DEFAULT_AUTO_BATCHES}）')
+    parser.add_argument('--predict-steps', type=int,
+                        help='预测步数（默认2，即预测后2个时间窗口）')
+    parser.add_argument('--predict-targets', nargs='+',
+                        help='预测目标指标列表')
 
     args = parser.parse_args()
 
@@ -371,6 +446,10 @@ def main():
         pipeline.config['output_dir'] = args.output
     if args.auto_batches:
         pipeline.config['auto_batches'] = args.auto_batches
+    if args.predict_steps:
+        pipeline.config['prediction']['predict_steps'] = args.predict_steps
+    if args.predict_targets:
+        pipeline.config['prediction']['targets'] = args.predict_targets
 
     success = pipeline.run(steps=args.steps, max_batches=args.max_batches)
 
