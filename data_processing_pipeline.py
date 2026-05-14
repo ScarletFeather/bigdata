@@ -178,12 +178,138 @@ class DataCleaningPipeline:
             save_dir = os.path.join(self.output_dir, 'device_analysis')
         return self.load_analyzer.run_full_analysis(raw_df, save_dir=save_dir)
 
+    # ================================================================
+    # 独立预测步骤（可反复重跑）
+    # ================================================================
+
+    def run_prediction(self):
+        """
+        独立的负载预测步骤 — 可反复重跑
+
+        从 data/processed/processed_io_traces*.csv 加载原始 I/O 数据，
+        自动指定列名并构造 datetime 列，然后调用 TimeSeriesPredictor。
+
+        Returns:
+            预测目录路径，失败返回 None
+        """
+        io_chunks = sorted(glob.glob(
+            os.path.join(self.processed_data_dir, 'processed_io_traces*.csv')
+        ))
+
+        if io_chunks:
+            logger.info(f"从 {len(io_chunks)} 个 I/O 轨迹块加载数据...")
+            chunks = []
+            for f in io_chunks:
+                # CSV 无表头，指定 header=None
+                df_chunk = pd.read_csv(f, low_memory=False, header=None)
+                chunks.append(df_chunk)
+            df = pd.concat(chunks, ignore_index=True)
+            # 指定列名：序号, R/W, device_id, size, timestamp, ...
+            col_count = df.shape[1]
+            names = ['row_idx', 'operation', 'device_id', 'size', 'timestamp']
+            if col_count > 5:
+                names += [f'col_{i}' for i in range(5, col_count)]
+            df.columns = names
+            logger.info(f"已指定列名: {names[:5]}")
+        else:
+            cleaned_files = sorted(glob.glob(
+                os.path.join(self.processed_data_dir, 'cleaned_data_*.csv')
+            ))
+            if not cleaned_files:
+                logger.error("没有找到 I/O 轨迹数据，请先运行 load_analysis")
+                return None
+            logger.info(f"使用合并数据: {cleaned_files[-1]}")
+            df = pd.read_csv(cleaned_files[-1], low_memory=False)
+
+        logger.info(f"预测数据: {len(df)} 行")
+
+        # 构造 datetime 列
+        if 'datetime' not in df.columns and 'timestamp' in df.columns:
+            for unit in ['us', 'ms', 's']:
+                try:
+                    df['datetime'] = pd.to_datetime(df['timestamp'], unit=unit, errors='raise')
+                    logger.info(f"  datetime 构造成功 (unit={unit})")
+                    break
+                except Exception:
+                    pass
+            if 'datetime' not in df.columns:
+                logger.error("无法从 timestamp 构造 datetime 列")
+                return None
+
+        if len(df) < 10:
+            logger.error(f"数据量不足: {len(df)} < 10")
+            return None
+
+        logger.info(f"数据准备完成: {len(df)} 行, 列: {list(df.columns[:6])}")
+
+        prediction_dir = os.path.join(self.output_dir, 'prediction')
+        os.makedirs(prediction_dir, exist_ok=True)
+
+        logger.info("=" * 60)
+        logger.info("开始负载预测")
+        logger.info("=" * 60)
+
+        result = self.predict_load(df, save_dir=prediction_dir)
+
+        if result:
+            logger.info("=" * 60)
+            logger.info("负载预测完成")
+            logger.info("=" * 60)
+        return prediction_dir if result else None
+
+    # ================================================================
+    # 回归测试（可反复重跑）
+    # ================================================================
+
+    def run_regression_test(self):
+        """
+        运行回归测试 — 反复可重用的多模型回归性能评估
+
+        使用 device_analysis/device_profiles.csv 数据，对多个回归模型
+        (Linear, Ridge, RandomForest, GradientBoosting) 进行评估，
+        生成偏差可视化图表和 HTML 报告，结果保存到 output/regression_analysis/。
+
+        Returns:
+            回归分析目录路径
+        """
+        profiles_path = os.path.join(self.output_dir, 'device_analysis', 'device_profiles.csv')
+        if not os.path.exists(profiles_path):
+            logger.error(f"设备画像不存在: {profiles_path}，请先运行 load_analysis")
+            return None
+
+        profiles_df = pd.read_csv(profiles_path)
+        if len(profiles_df) < 10:
+            logger.error(f"数据量不足: {len(profiles_df)} < 10")
+            return None
+
+        regression_dir = os.path.join(self.output_dir, 'regression_analysis')
+        os.makedirs(regression_dir, exist_ok=True)
+        logger.info("=" * 60)
+        logger.info("开始回归测试")
+        logger.info("=" * 60)
+
+        try:
+            from src.device_load_analysis.load_reporter import LoadReporter
+            reporter = LoadReporter(save_dir=regression_dir)
+            reporter.visualize_regression_test(profiles_df, save_dir=regression_dir)
+            logger.info(f"回归测试完成，结果保存在: {regression_dir}")
+        except Exception as e:
+            logger.error(f"回归测试失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+        logger.info("=" * 60)
+        logger.info("回归测试完成")
+        logger.info("=" * 60)
+        return regression_dir
+
     def predict_load(self, df_raw_io, save_dir=None):
         """
         基于原始 I/O 数据进行回归预测
 
         Args:
-            df_raw_io: 原始 I/O 轨迹 DataFrame（来自 parse_io_traces）
+            df_raw_io: 原始 I/O 轨迹 DataFrame
             save_dir: 可视化保存目录
 
         Returns:
@@ -200,14 +326,67 @@ class DataCleaningPipeline:
 
         if save_dir is None:
             save_dir = os.path.join(self.output_dir, 'prediction')
+        os.makedirs(save_dir, exist_ok=True)
 
         logger.info("=" * 60)
         logger.info(f"开始负载预测: 目标={targets}, 预测步数={predict_steps}")
         logger.info("=" * 60)
 
+        # ---- 数据预处理：确保包含必要列 ----
+        df = df_raw_io.copy()
+        required_cols = {'datetime', 'operation', 'device_id', 'size'}
+        missing = required_cols - set(df.columns)
+        if missing:
+            logger.warning(f"数据缺少列 {missing}，尝试自动推断...")
+            cols = list(df.columns)
+            # 尝试推断 operation 列（第2列，值为 R/W）
+            if 'operation' not in df.columns and len(cols) > 1:
+                sample = str(df.iloc[0, 1]) if len(df) > 0 else ''
+                if sample.upper() in ['R', 'W']:
+                    df = df.rename(columns={df.columns[1]: 'operation'})
+                    missing.discard('operation')
+            # 推断 device_id（第3列，大整数）
+            if 'device_id' not in df.columns and len(cols) > 2:
+                try:
+                    df = df.rename(columns={df.columns[2]: 'device_id'})
+                    missing.discard('device_id')
+                except Exception:
+                    pass
+            # 推断 size（第4列，整数/浮点数）
+            if 'size' not in df.columns and len(cols) > 3:
+                try:
+                    df = df.rename(columns={df.columns[3]: 'size'})
+                    missing.discard('size')
+                except Exception:
+                    pass
+            # 从 timestamp 构造 datetime
+            if 'datetime' not in df.columns and 'timestamp' in df.columns:
+                logger.info("从 timestamp 列构造 datetime...")
+                ts_col = df['timestamp']
+                # 尝试毫秒/微秒/秒
+                for unit in ['ms', 'us', 's']:
+                    try:
+                        df['datetime'] = pd.to_datetime(ts_col, unit=unit, errors='raise')
+                        logger.info(f"  datetime 构造成功 (unit={unit})")
+                        missing.discard('datetime')
+                        break
+                    except Exception:
+                        pass
+            if missing:
+                logger.error(f"数据仍缺少必要列: {missing}，当前列: {list(df.columns)}")
+                logger.error("请确保传入的是原始 I/O 轨迹数据（含 datetime/timestamp 列）")
+                return None
+
+        # 确保数据量足够
+        if len(df) < 10:
+            logger.error(f"数据量不足: {len(df)} < 10")
+            return None
+
+        logger.info(f"预测数据: {len(df)} 行, 列: {list(df.columns[:8])}")
+
         try:
             all_results = self.predictor.run_multi_target_prediction(
-                df_raw_io, targets=targets, model_names=models,
+                df, targets=targets, model_names=models,
                 n_lags=n_lags, predict_steps=predict_steps
             )
 
@@ -215,12 +394,14 @@ class DataCleaningPipeline:
             self.predictor.print_report(all_results)
 
             # 生成可视化
-            self.predictor.visualize_predictions(all_results, df_raw_io, save_dir)
+            self.predictor.visualize_predictions(all_results, df, save_dir)
 
             logger.info(f"预测完成，结果保存至: {save_dir}")
             return all_results
         except Exception as e:
             logger.error(f"预测失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
 
@@ -393,19 +574,33 @@ class DataCleaningPipeline:
                     return False
 
             if 'clean' in steps or 'analyze' in steps or 'visualize' in steps \
-                    or 'load_analysis' in steps or 'predict' in steps:
+                    or 'load_analysis' in steps:
                 output_file = self.process_data(max_batches=max_batches)
                 if output_file:
                     logger.info(f"处理完成，输出文件: {output_file}")
-                elif 'load_analysis' not in steps and 'predict' not in steps:
+                elif 'load_analysis' not in steps:
                     logger.error("数据处理失败")
                     return False
                 else:
                     logger.info("数据处理阶段完成（仅分析/预测模式）")
-                return True
-            else:
-                logger.info("数据下载完成")
-                return True
+
+            # 预测步骤（独立可重跑）
+            if 'predict' in steps:
+                pred_dir = self.run_prediction()
+                if pred_dir:
+                    logger.info(f"预测完成，结果保存在: {pred_dir}")
+                else:
+                    logger.warning("预测步骤未产生结果")
+
+            # 回归测试步骤（可独立重跑）
+            if 'regression_test' in steps:
+                reg_dir = self.run_regression_test()
+                if reg_dir:
+                    logger.info(f"回归测试完成，结果保存在: {reg_dir}")
+                else:
+                    logger.warning("回归测试未产生结果")
+
+            return True
         except Exception as e:
             logger.error(f"运行失败: {e}")
             return False
@@ -424,7 +619,7 @@ def main():
     parser.add_argument('--output', help='输出目录')
     parser.add_argument('--steps', nargs='+',
                         choices=['download', 'clean', 'analyze', 'visualize',
-                                 'load_analysis', 'predict'],
+                                 'load_analysis', 'predict', 'regression_test'],
                         help='要运行的步骤列表')
     parser.add_argument('--max-batches', type=int, help='最大处理批次数量')
     parser.add_argument('--auto-batches', type=int,

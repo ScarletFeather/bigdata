@@ -199,8 +199,8 @@ class OSSDataProcessor:
                 logger.warning(f"无法提取文件: {member.name}")
                 return True
             
-            # 逐块读取CSV文件
-            for chunk_num, chunk in enumerate(pd.read_csv(file_obj, chunksize=10000)):
+            # 逐块读取CSV文件（Alibaba trace CSV 无表头，指定 header=None）
+            for chunk_num, chunk in enumerate(pd.read_csv(file_obj, chunksize=10000, header=None)):
                 logger.info(f"处理CSV块 {chunk_num + 1}, 行数: {len(chunk)}")
                 
                 # 调用用户定义的处理函数
