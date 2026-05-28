@@ -173,8 +173,9 @@ class DataCleaningPipeline:
                 logger.error("流式处理未产生任何数据")
                 return False
 
-            # 最终保存聚合数据（增量保存已持续更新，这里做最终完整覆盖）
-            # 仅当数据流自然结束时才清理 checkpoint，否则保留以便下次续传
+            # 最终保存聚合数据 + checkpoint 清理。
+            # process() 内部已调用 _incremental_save 做最终保存（关掉 gap），
+            # save_aggregation 再做一次完整覆盖 + 打印摘要 + 根据 stream_ended 决定是否清理 checkpoint。
             processor.save_aggregation(device_analysis_dir, keep_checkpoint=not stream_ended)
 
             # 判断是否部分完成（达到限制而非自然结束）
@@ -400,7 +401,7 @@ class DataCleaningPipeline:
 
     def resume(self):
         """从 checkpoint 恢复阶段1聚合（断点续传）"""
-        from src.data_download.streaming_processor import CheckpointManager
+        from src.data_download.checkpoint_manager import CheckpointManager
 
         streaming_config = self.config.get('streaming', {})
         work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
@@ -415,7 +416,7 @@ class DataCleaningPipeline:
 
     def clear_checkpoint(self):
         """清除流式处理的 checkpoint（从头开始）"""
-        from src.data_download.streaming_processor import CheckpointManager
+        from src.data_download.checkpoint_manager import CheckpointManager
 
         streaming_config = self.config.get('streaming', {})
         work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
