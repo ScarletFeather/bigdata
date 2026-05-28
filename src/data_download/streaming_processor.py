@@ -46,13 +46,13 @@ class CheckpointManager:
     def save(self, state: dict):
         """序列化并保存 checkpoint"""
         state['_saved_at'] = datetime.now().isoformat()
-        state['_version'] = 2
+        state['_version'] = 3
         serialized = self._to_serializable(state)
         tmp = str(self.checkpoint_file) + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(serialized, f, ensure_ascii=False)
         os.replace(tmp, str(self.checkpoint_file))
-        logger.info(f"Checkpoint 已保存: {len(json.dumps(serialized))} 字节")
+        logger.info(f"Checkpoint 已保存: {os.path.getsize(str(self.checkpoint_file)):,} 字节")
 
     def load(self) -> dict:
         """加载 checkpoint"""
@@ -768,14 +768,12 @@ class StreamingTarProcessor:
             self.temp_file.unlink(missing_ok=True)
             logger.info(f"已清理旧临时文件 ({old_size / (1024**3):.2f} GB)")
 
-        # 2. 读取限制配置（必须在 checkpoint 之前，日志要用）
+        # 2. 读取限制配置
         max_rows = self.aggregator.max_rows
         max_gb_total = self.config.get('max_gb', 0)
         if max_gb_total <= 0:
             max_gb_total = self.config.get('partial_end_gb', 0)  # 兼容旧 config.json
-        max_gb_incremental = self.config.get('max_gb_incremental', 0)
         max_total_bytes = max_gb_total * (1024 ** 3) if max_gb_total > 0 else 0
-        max_inc_bytes = max_gb_incremental * (1024 ** 3) if max_gb_incremental > 0 else 0
 
         # 3. 检查 checkpoint 并恢复聚合状态
         cp_state = self.checkpoint.load()
@@ -783,7 +781,6 @@ class StreamingTarProcessor:
             self.bytes_downloaded = cp_state.get('total_bytes_downloaded', 0)
             self.decompressed_bytes = cp_state.get('decompressed_bytes', 0)
             self.aggregator.from_checkpoint_state(cp_state.get('aggregator', {}))
-            # 显示 checkpoint 状态：累计值 + 总量目标 + 本次增量目标
             msg = (f"从 checkpoint 恢复: 累计已解压 {self.decompressed_bytes / (1024**3):.2f} GB, "
                    f"已聚合 {self.aggregator.total_rows:,} 行, "
                    f"{len(self.aggregator.processed_members)} 个成员已处理")
@@ -792,16 +789,14 @@ class StreamingTarProcessor:
                 msg += f" | 总量目标 {max_gb_total:.2f} GB，剩余 {remaining:.2f} GB"
                 if remaining <= 0:
                     msg += " (已达总量上限)"
-            if max_gb_incremental > 0:
-                msg += f" | 本次增量: {max_gb_incremental:.2f} GB"
             logger.info(msg)
         else:
             self.bytes_downloaded = 0
             self.decompressed_bytes = 0
             self.aggregator.reset()
             msg = "从零开始 — 无 checkpoint"
-            if max_gb_incremental > 0:
-                msg += f"（本次增量目标 {max_gb_incremental:.2f} GB，总量目标 {max_gb_total:.2f} GB）"
+            if max_gb_total > 0:
+                msg += f"（总量目标 {max_gb_total:.2f} GB）"
             logger.info(msg)
 
         # 记录本次运行开始时的累计值（用于计算本次增量进度百分比）
@@ -821,41 +816,35 @@ class StreamingTarProcessor:
             logger.warning("无法获取文件大小")
 
         # 6. 真正的流式处理：HTTP → gzip → tar → 增量聚合
-        self._true_stream_process(progress_callback, max_gb_total, max_gb_incremental)
+        self._stream_ended_naturally = False
+        self._true_stream_process(progress_callback, max_gb_total)
 
         # 7. 导出最终结果
         results = self._build_final_results()
+        results['_stream_ended_naturally'] = self._stream_ended_naturally
         logger.info(f"流式处理完成: {self.aggregator.total_rows:,} 行, "
                     f"{len(self.aggregator.dev_stats)} 个设备, "
                     f"累计解压 {self.decompressed_bytes / (1024**3):.2f} GB")
 
         return results
 
-    def _true_stream_process(self, progress_callback=None, max_gb_total=0, max_gb_incremental=0):
+    def _true_stream_process(self, progress_callback=None, max_gb_total=0):
         """
         真正的流式处理管道：HTTP → gzip → tar → 逐成员聚合。
         不保存任何原始数据到磁盘。
 
-        max_gb_total: 累计总量目标（跨运行累积，如 20GB）
-        max_gb_incremental: 本次运行增量目标（如 0.1GB），百分比以此计算
+        max_gb_total: 累计总量目标（跨运行累积，如 20GB），达到后自动停止
         
         断点续传策略：重新下载，跳过已处理的 tar 成员。
         """
         processed = set(self.aggregator.processed_members)
         max_total_bytes = max_gb_total * (1024 ** 3) if max_gb_total > 0 else 0
-        max_inc_bytes = max_gb_incremental * (1024 ** 3) if max_gb_incremental > 0 else 0
-        # 如果没有增量限制，用总量作为本次限制（兼容旧行为）
-        if max_inc_bytes <= 0 and max_total_bytes > 0:
-            max_inc_bytes = max_total_bytes
-        # 如果增量限制超过总量剩余，裁剪
-        if max_total_bytes > 0 and max_inc_bytes > 0:
-            remaining_total = max_total_bytes - self.decompressed_at_start
-            max_inc_bytes = min(max_inc_bytes, remaining_total)
         rows_since_checkpoint = 0
         rows_since_incremental = 0
         member_count = 0
         first_save_done = False  # 第一次增量保存标志
         decomp_at_start = self.decompressed_at_start  # snapshot for this run
+        self._stream_ended_naturally = False  # 是否完整读完整个流
         
         if processed:
             logger.info(f"断点续传：将重新下载数据，跳过 {len(processed)} 个已处理成员")
@@ -940,10 +929,8 @@ class StreamingTarProcessor:
                 download_reader[0] = reader
 
                 info_parts = ["正在流式下载并解析数据"]
-                if max_gb_incremental > 0:
-                    info_parts.append(f"本次限制 {max_gb_incremental:.2f} GB")
                 if max_gb_total > 0:
-                    info_parts.append(f"累计目标 {max_gb_total:.2f} GB")
+                    info_parts.append(f"累计上限 {max_gb_total:.2f} GB")
                 info_parts.append("（前25秒每5秒汇报，之后每30秒）")
                 logger.info('，'.join(info_parts))
                 
@@ -964,12 +951,10 @@ class StreamingTarProcessor:
                             if member.isfile() and member.name.endswith('.csv') \
                                     and 'device_size' not in member.name.lower():
                                 logger.info(f"处理 [{member_count}]: {member.name} "
-                                            f"({member.size / (1024**2):.1f} MB)"
-                                            f"{f' [本次限制 {max_gb_incremental:.2f} GB]' if max_gb_incremental > 0 else ''}")
+                                            f"({member.size / (1024**2):.1f} MB)")
                                 rows_before = self.aggregator.total_rows
-                                # 传入本次增量限制字节数，用于进度百分比
                                 should_continue, actual_bytes = self._process_tar_member(
-                                    tar, member, max_inc_bytes, max_gb_incremental, decomp_at_start
+                                    tar, member, decomp_at_start
                                 )
                                 rows_processed_val = self.aggregator.total_rows - rows_before
                                 rows_since_checkpoint += rows_processed_val
@@ -998,7 +983,7 @@ class StreamingTarProcessor:
 
                                 # 进度回调
                                 if progress_callback:
-                                    progress_callback(self.bytes_downloaded, max_inc_bytes or 1,
+                                    progress_callback(self.bytes_downloaded, max_total_bytes,
                                                       self.aggregator.total_rows, 'stream')
 
                                 # 检查限制
@@ -1006,22 +991,17 @@ class StreamingTarProcessor:
                                 if max_rows_val > 0 and self.aggregator.total_rows >= max_rows_val:
                                     logger.info(f"已达目标行数 {max_rows_val:,}，停止处理")
                                     self._save_checkpoint()
+                                    rows_since_checkpoint = 0  # 避免 finally 重复保存
                                     return
-                                # 本次增量限制（优先级最高）
-                                if max_inc_bytes > 0 and (self.decompressed_bytes - decomp_at_start) >= max_inc_bytes:
-                                    run_done = (self.decompressed_bytes - decomp_at_start) / (1024**3)
-                                    cum = self.decompressed_bytes / (1024**3)
-                                    logger.info(f"本次增量已达 {max_gb_incremental:.2f} GB "
-                                                f"（本次实际 {run_done:.3f} GB，累计 {cum:.3f} GB），停止处理")
-                                    self._save_checkpoint()
-                                    return
-                                # 总量限制（兜底检查）
+                                # 总量限制
                                 if max_total_bytes > 0 and self.decompressed_bytes >= max_total_bytes:
                                     logger.info(f"累计已达总量目标 {max_gb_total:.2f} GB，停止处理")
                                     self._save_checkpoint()
+                                    rows_since_checkpoint = 0  # 避免 finally 重复保存
                                     return
                                 if not should_continue:
                                     self._save_checkpoint()
+                                    rows_since_checkpoint = 0  # 避免 finally 重复保存
                                     return
 
                             elif member.isfile() and member.name.endswith('.json'):
@@ -1031,6 +1011,7 @@ class StreamingTarProcessor:
 
                 logger.info(f"数据流传输完成，共读取 {reader.bytes_total / (1024**3):.2f} GB, "
                             f"{member_count} 个 tar 成员")
+                self._stream_ended_naturally = True
                 break
 
             except Exception as e:
@@ -1046,13 +1027,11 @@ class StreamingTarProcessor:
                     self._save_checkpoint()
 
     def _process_tar_member(self, tar: tarfile.TarFile, member: tarfile.TarInfo,
-                            max_inc_bytes=0, max_gb_inc=0, decomp_at_start=0):
+                            decomp_at_start=0):
         """处理单个 tar 成员中的 CSV 数据。
         返回 (should_continue, bytes_read_total)：
           - should_continue=True 表示继续处理下一个成员
           - bytes_read_total 是实际读取的字节数（用于准确追踪解压大小）
-        max_inc_bytes: 本次增量限制字节数（用于进度百分比分母和停止条件）
-        max_gb_inc: 本次增量限制 GB 值（仅用于日志显示）
         decomp_at_start: 本次运行开始时的累计解压字节数
         """
         fileobj = tar.extractfile(member)
@@ -1082,22 +1061,9 @@ class StreamingTarProcessor:
                 if mb_processed >= last_log_mb + 20 or (now - last_log_time >= 15 and mb_processed > last_log_mb):
                     last_log_mb = mb_processed
                     last_log_time = now
-                    # 百分比基于本次增量目标，不再基于整个文件大小（768GB → 0.0%）
-                    if max_inc_bytes > 0:
-                        pct = bytes_processed / max_inc_bytes * 100
-                        pct_str = f"{pct:.1f}% (本次目标 {max_gb_inc:.2f} GB)"
-                    else:
-                        pct_str = ""
                     cum_now = (decomp_at_start + self.decompressed_bytes + bytes_processed) / (1024**3)
                     logger.info(f"  {member.name}: 已解压 {mb_processed} MB "
-                                f"({pct_str}) | 累计 {cum_now:.3f} GB | 已聚合 {self.aggregator.total_rows:,} 行")
-
-                # 达到本次增量限制 → 停止（不继续读更多数据）
-                if max_inc_bytes > 0 and (self.decompressed_bytes - decomp_at_start) + bytes_processed >= max_inc_bytes:
-                    cum_now = (self.decompressed_bytes + bytes_processed) / (1024**3)
-                    logger.info(f"  {member.name}: 本次增量已达 {max_gb_inc:.2f} GB "
-                                f"（累计 {cum_now:.3f} GB），停止读取当前成员")
-                    return True, bytes_processed
+                                f"| 累计 {cum_now:.3f} GB | 已聚合 {self.aggregator.total_rows:,} 行")
 
                 # 找到最后一个完整行
                 last_nl = pending.rfind(b'\n')
@@ -1134,7 +1100,9 @@ class StreamingTarProcessor:
             return True, 0
 
     def _save_checkpoint(self):
-        """保存当前 checkpoint"""
+        """保存当前 checkpoint（保存前裁剪 block_stats 减小文件体积）"""
+        # checkpoint 文件只需保留最热的 block 用于续传，裁到 5000 条
+        self.aggregator.prune_block_stats(max_entries=5000)
         state = {
             'total_bytes_downloaded': self.bytes_downloaded,
             'decompressed_bytes': self.decompressed_bytes,
@@ -1144,7 +1112,7 @@ class StreamingTarProcessor:
         self.checkpoint.save(state)
 
     def _incremental_save(self):
-        """增量保存当前分析结果到 output_dir（用户随时可查看）并释放内存"""
+        """增量保存当前分析结果到 output_dir + 同时保存轻量 checkpoint"""
         if not self.output_dir:
             return
         try:
@@ -1157,10 +1125,23 @@ class StreamingTarProcessor:
                         f"({self.aggregator.total_rows:,} 行, "
                         f"{len(self.aggregator.dev_stats):,} 设备, "
                         f"{len(self.aggregator.block_stats):,} blocks)")
-            # 保存后立即裁剪 block_stats 释放内存（保留 Top 100k 热点 block）
-            self.aggregator.prune_block_stats(max_entries=100000)
+            # 保存后立即裁剪 block_stats 释放内存（保留 Top 30000 热点 block）
+            self.aggregator.prune_block_stats(max_entries=30000)
+            # 同时保存轻量 checkpoint（裁剪到 5000 条），支持随时中断和续传
+            self._save_checkpoint_light()
         except Exception as e:
             logger.debug(f"增量保存跳过: {e}")
+
+    def _save_checkpoint_light(self):
+        """保存轻量 checkpoint（更激进裁剪，体积更小，用于频繁保存）"""
+        self.aggregator.prune_block_stats(max_entries=2000)
+        state = {
+            'total_bytes_downloaded': self.bytes_downloaded,
+            'decompressed_bytes': self.decompressed_bytes,
+            'total_file_size': self.total_file_size,
+            'aggregator': self.aggregator.to_checkpoint_state(),
+        }
+        self.checkpoint.save(state)
 
     def _build_final_results(self) -> dict:
         """构建最终分析结果（仅保留阶段2需要的5个核心数据集）"""
@@ -1229,9 +1210,13 @@ class StreamingTarProcessor:
                 except Exception:
                     pass
 
-    def save_aggregation(self, save_dir: str) -> dict:
+    def save_aggregation(self, save_dir: str, keep_checkpoint: bool = False) -> dict:
         """
         阶段1: 仅保存聚合数据（CSV + JSON），不生成可视化和报告。
+
+        Args:
+            save_dir: 保存目录
+            keep_checkpoint: 是否保留 checkpoint（部分完成时保留以便续传）
 
         Returns:
             分析结果字典
@@ -1251,11 +1236,15 @@ class StreamingTarProcessor:
         # 仅保存数据文件（CSV/JSON），不生成图表
         reporter.save_results(results, save_dir)
 
-        # 清理 checkpoint 及工作目录（断点续传用 checkpoint.json，无需额外 dump）
-        self.checkpoint.clear()
-        self._cleanup_work_dir()
-        self._cleanup_empty_data_dirs()
-        logger.info("中间文件已清理")
+        if not keep_checkpoint:
+            # 完全完成时清理 checkpoint
+            self.checkpoint.clear()
+            self._cleanup_work_dir()
+            self._cleanup_empty_data_dirs()
+            logger.info("中间文件已清理，checkpoint 已清除")
+        else:
+            # 部分完成时保留 checkpoint，以便下次继续
+            logger.info("checkpoint 已保留，可用 --resume 继续处理")
 
         return results
 

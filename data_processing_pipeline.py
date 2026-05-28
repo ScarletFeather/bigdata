@@ -59,9 +59,8 @@ class DataCleaningPipeline:
             'output_dir': 'output',
             'streaming': {
                 'work_dir': 'data/stream_checkpoints',
-                'checkpoint_interval_rows': 5000000,
+                'checkpoint_interval_rows': 5000000,  # 每500万行保存 checkpoint
                 'max_retries': 3,
-                'max_rows': 50000000,
                 'max_gb': 20,
                 'sample_ratio': 1.0,
             },
@@ -104,9 +103,6 @@ class DataCleaningPipeline:
             max_gb = self.config.get('max_gb', 0)
         if max_gb <= 0:
             max_gb = self.config.get('partial_end_gb', 0)
-        # max_gb_incremental: 本次运行增量目标（如 0.1GB），
-        # 每次运行只处理这么多，checkpoint 累计到 max_gb 为止
-        max_gb_incremental = streaming_config.get('max_gb_incremental', 0)
         return {
             'max_retries': streaming_config.get('max_retries', self.config.get('max_retries', 3)),
             'chunk_size_mb': streaming_config.get('download_chunk_mb', 10),
@@ -115,7 +111,6 @@ class DataCleaningPipeline:
             # 优化参数
             'max_rows': streaming_config.get('max_rows', 0),
             'max_gb': max_gb,
-            'max_gb_incremental': max_gb_incremental,
             'sample_ratio': streaming_config.get('sample_ratio', 1.0),
             'top_device_ts': streaming_config.get('top_device_ts', 50),
             'skip_second_dist': streaming_config.get('skip_second_dist', False),
@@ -129,7 +124,9 @@ class DataCleaningPipeline:
           "聚合完成！共 X 行 Y 设备。请运行 --stage 2 进行可视化。"
 
         Returns:
-            True 成功 / False 失败
+            'complete'  完全完成（数据全部处理完毕）
+            'partial'   部分完成（达到 max_rows/max_gb 限制，可继续）
+            False       失败
         """
         from src.data_download.streaming_processor import StreamingTarProcessor
 
@@ -138,6 +135,7 @@ class DataCleaningPipeline:
         url = self.config['oss_url']
         full_config = self._get_streaming_config()
         max_rows = full_config.get('max_rows', 0)
+        max_gb = full_config.get('max_gb', 0)
 
         device_analysis_dir = os.path.join('data', 'device_analysis')
         processor = StreamingTarProcessor(url, work_dir, full_config, output_dir=device_analysis_dir)
@@ -150,12 +148,8 @@ class DataCleaningPipeline:
             logger.info(f"目标 URL: {url}")
             logger.info(f"工作目录: {work_dir}")
             logger.info(f"输出目录: {self.output_dir}")
-            max_gb = full_config.get('max_gb', 0)
-            max_gb_inc = full_config.get('max_gb_incremental', 0)
             if max_gb > 0:
                 logger.info(f"累计目标: {max_gb} GB（checkpoint 跨运行累积）")
-            if max_gb_inc > 0:
-                logger.info(f"本次增量: {max_gb_inc} GB")
             if max_rows > 0:
                 logger.info(f"目标行数: {max_rows:,}")
             sample_ratio = full_config.get('sample_ratio', 1.0)
@@ -173,16 +167,37 @@ class DataCleaningPipeline:
             results = processor.process(progress_callback=_progress_callback)
             total_rows = results.get('total_rows_processed', 0)
             total_devices = results.get('total_devices', 0)
+            stream_ended = results.get('_stream_ended_naturally', False)
 
             if total_rows == 0:
                 logger.error("流式处理未产生任何数据")
                 return False
 
             # 最终保存聚合数据（增量保存已持续更新，这里做最终完整覆盖）
-            processor.save_aggregation(device_analysis_dir)
+            # 仅当数据流自然结束时才清理 checkpoint，否则保留以便下次续传
+            processor.save_aggregation(device_analysis_dir, keep_checkpoint=not stream_ended)
+
+            # 判断是否部分完成（达到限制而非自然结束）
+            reached_limit = False
+            if max_rows > 0 and total_rows >= max_rows:
+                reached_limit = True
+            if max_gb > 0 and processor.decompressed_bytes >= max_gb * (1024 ** 3):
+                reached_limit = True
+
+            if reached_limit and not stream_ended:
+                logger.info("=" * 60)
+                logger.info("【阶段1 中断】达到处理上限，checkpoint 已保留")
+                logger.info(f"  聚合行数: {total_rows:,}")
+                logger.info(f"  设备数量: {total_devices}")
+                logger.info(f"  数据位置: {device_analysis_dir}")
+                logger.info("")
+                logger.info("  >>> 继续处理: python data_processing_pipeline.py --resume")
+                logger.info("  >>> 或查看当前数据: python data_processing_pipeline.py --stage 2")
+                logger.info("=" * 60)
+                return 'partial'
 
             logger.info("=" * 60)
-            logger.info("【阶段1 完成】")
+            logger.info("【阶段1 完成】数据已全部处理")
             logger.info(f"  聚合行数: {total_rows:,}")
             logger.info(f"  设备数量: {total_devices}")
             logger.info(f"  数据位置: {device_analysis_dir}")
@@ -191,7 +206,7 @@ class DataCleaningPipeline:
             logger.info("  >>> （生成图表 + 负载预测，可反复重跑）")
             logger.info("=" * 60)
 
-            return True
+            return 'complete'
 
         except KeyboardInterrupt:
             logger.info("\n用户中断，checkpoint 已保存。恢复: --resume")
@@ -290,13 +305,24 @@ class DataCleaningPipeline:
         1. 流式下载 + 增量聚合 — 边下载边提取分析，只保留聚合结果
         2. 生成设备负载分析图表和报告
         3. 运行负载预测（基于聚合后的时间序列）
+
+        注意：如果阶段1因达到限制（max_rows/max_gb）而部分完成，
+        不会自动执行阶段2，避免每次 --resume 都重新生成报告。
         """
         # 先执行阶段1
-        if not self.run_aggregate():
+        stage1_result = self.run_aggregate()
+        if stage1_result == False:
             logger.warning("阶段1 聚合失败或中断")
             return False
 
-        # 再执行阶段2
+        if stage1_result == 'partial':
+            # 部分完成（达到限制），不自动运行阶段2
+            # 用户可手动运行 --stage 2 查看当前数据
+            logger.info("阶段1 部分完成（达到上限），跳过阶段2。")
+            logger.info("请用 --resume 继续处理，或用 --stage 2 基于当前数据生成报告。")
+            return False
+
+        # 再执行阶段2（仅在完全完成时）
         if not self.run_visualize_and_predict():
             logger.warning("阶段2 可视化/预测失败")
             return False
@@ -360,9 +386,13 @@ class DataCleaningPipeline:
 
         Args:
             stage: 1=聚合, 2=可视化+预测, 默认=1+2
+
+        Returns:
+            True/False 表示管道执行成功与否
         """
         if stage == 1:
-            return self.run_aggregate()
+            result = self.run_aggregate()
+            return result in ('complete', 'partial')
         elif stage == 2:
             return self.run_visualize_and_predict()
         else:
@@ -409,20 +439,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 阶段1: 下载+聚合（断点续传，约20GB=50M行）
-  python data_processing_pipeline.py --stage 1 --max-rows 50000000
+  # 阶段1: 下载+聚合（持续处理直到20GB上限，支持断点续传）
+  python data_processing_pipeline.py --stage 1
 
   # 阶段2: 可视化+预测（基于阶段1结果，可反复重跑）
   python data_processing_pipeline.py --stage 2
 
   # 一键跑完阶段1+2
-  python data_processing_pipeline.py --max-rows 50000000
+  python data_processing_pipeline.py
 
   # 从 checkpoint 恢复阶段1
   python data_processing_pipeline.py --resume
 
   # 清除 checkpoint 重新开始
   python data_processing_pipeline.py --clear-checkpoint
+
+  # 自定义处理上限
+  python data_processing_pipeline.py --stage 1 --max-gb 10
 
   # 50% 采样加速测试
   python data_processing_pipeline.py --stage 1 --sample-ratio 0.5
@@ -436,7 +469,7 @@ def main():
     parser.add_argument('--max-rows', type=int,
                         help='最大处理行数')
     parser.add_argument('--max-gb', type=float,
-                        help='最大下载量 GB（默认 20）')
+                        help='累计处理上限 GB（默认 20）')
     parser.add_argument('--sample-ratio', type=float,
                         help='采样率 0~1')
     parser.add_argument('--predict-steps', type=int,
@@ -473,7 +506,7 @@ def main():
     if args.max_rows:
         pipeline.config['streaming']['max_rows'] = args.max_rows
     if args.max_gb:
-        pipeline.config['streaming']['max_gb_incremental'] = args.max_gb
+        pipeline.config['streaming']['max_gb'] = args.max_gb
     if args.sample_ratio is not None:
         pipeline.config['streaming']['sample_ratio'] = args.sample_ratio
 

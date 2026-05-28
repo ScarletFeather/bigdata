@@ -9,10 +9,9 @@
   "auto_batches": 20,
   "streaming": {
     "work_dir": "data/stream_checkpoints",
-    "checkpoint_interval_rows": 20000000,
+    "checkpoint_interval_rows": 5000000,
     "download_chunk_mb": 50,
     "max_retries": 3,
-    "max_rows": 50000000,
     "max_gb": 20,
     "sample_ratio": 1.0,
     "top_device_ts": 50,
