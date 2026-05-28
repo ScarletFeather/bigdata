@@ -7,6 +7,17 @@
   "partial_end_gb": 1,
   "output_dir": "output",
   "auto_batches": 20,
+  "streaming": {
+    "work_dir": "data/stream_checkpoints",
+    "checkpoint_interval_rows": 20000000,
+    "download_chunk_mb": 50,
+    "max_retries": 3,
+    "max_rows": 50000000,
+    "max_gb": 20,
+    "sample_ratio": 1.0,
+    "top_device_ts": 50,
+    "skip_second_dist": true
+  },
   "cleaning": {
     "missing_value_strategy": "median",
     "outlier_strategy": "iqr"
@@ -17,7 +28,7 @@
   },
   "load_analysis": {
     "time_window": 60,
-    "top_n_devices": null,
+    "top_n_devices": 50,
     "hotspot_threshold": 10
   }
 }

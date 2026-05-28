@@ -1,0 +1,33 @@
+{
+  "global_read_ratio": 0.3242742112056492,
+  "global_write_ratio": 0.6757257887943509,
+  "request_size_stats": {
+    "count": 2612468,
+    "mean": 74862.85538425733,
+    "std": 159342.72790797273,
+    "min": -403165.32833966083,
+    "25%": -32613.814589670277,
+    "50%": 74862.85538425733,
+    "75%": 182339.52535818494,
+    "max": 552891.0391081756
+  },
+  "dominant_request_size": 74862,
+  "sequential_access_ratio": 0.0,
+  "sequential_access_std": 0.0,
+  "active_window_ratio": 1.0,
+  "total_time_windows": 5,
+  "active_time_windows": 5,
+  "peak_hour": 8,
+  "off_peak_hour": 8,
+  "hourly_distribution": {
+    "8": 2612468
+  },
+  "minute_distribution": {
+    "16:00": 545443,
+    "16:01": 497426,
+    "16:02": 652968,
+    "16:03": 519707,
+    "16:04": 396924
+  },
+  "second_distribution": {}
+}

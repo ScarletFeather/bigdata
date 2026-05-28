@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-数据处理管道（编排器）
-集成数据下载、清洗、设备负载分析、预测功能
+数据处理管道（编排器）— 流式两阶段处理
+
+  --stage 1: HTTP → gzip → tar → 增量聚合 → 保存 CSV/JSON（断点续传）
+  --stage 2: 加载聚合数据 → 生成图表 + 报告 + 负载预测（可反复重跑）
+
+输出位置:
+  聚合数据: data/device_analysis/ (CSV/JSON)
+  可视化报告: output/device_analysis/ (HTML/PNG)
+  预测结果: output/prediction/
 """
 
 import pandas as pd
-import numpy as np
 import os
 import json
 import logging
-import glob
-from datetime import datetime
-from src.data_download.oss_data_processor import OSSDataProcessor
-from src.data_cleaning.preprocessor import DataPreprocessor
-from src.data_analysis.analyzer import DataAnalyzer
-from src.device_load_analysis import DeviceLoadAnalyzer
 from src.models.predictor import TimeSeriesPredictor
 
 # 配置日志
@@ -28,60 +28,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 默认自动批次数
-DEFAULT_AUTO_BATCHES = 5
+def format_bytes(size_bytes):
+    """格式化字节为可读字符串"""
+    if size_bytes is None:
+        return '?'
+    if size_bytes >= 1024 ** 3:
+        return f'{size_bytes / (1024 ** 3):.2f} GB'
+    elif size_bytes >= 1024 ** 2:
+        return f'{size_bytes / (1024 ** 2):.2f} MB'
+    elif size_bytes >= 1024:
+        return f'{size_bytes / 1024:.2f} KB'
+    return f'{size_bytes} B'
 
 
 class DataCleaningPipeline:
-    """数据清洗管道"""
+    """数据处理管道 — 流式两阶段：聚合 → 可视化+预测"""
 
     def __init__(self, config_file=None):
         self.config = self._load_config(config_file)
         self.output_dir = self.config.get('output_dir', 'output')
-        self.data_dir = 'data'
-        self.raw_data_dir = os.path.join(self.data_dir, 'raw')
-        self.processed_data_dir = os.path.join(self.data_dir, 'processed')
-        self.downloader = None
-        self.preprocessor = None
-        self.analyzer = None
-        self.load_analyzer = None
-        self.predictor = None
+        self.streaming_processor = None
 
         os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.raw_data_dir, exist_ok=True)
-        os.makedirs(self.processed_data_dir, exist_ok=True)
 
     def _load_config(self, config_file):
-        """加载配置文件"""
+        """加载配置文件，默认值会被 config.json 覆盖"""
         default_config = {
             'oss_url': 'http://block-traces.oss-cn-beijing.aliyuncs.com/alibaba_block_traces_2020.tar.gz',
             'max_retries': 3,
-            'chunk_size_mb': 50,
-            'download_mode': 'partial',
-            'partial_start_gb': 0,
-            'partial_end_gb': 0.5,
             'output_dir': 'output',
-            'auto_batches': DEFAULT_AUTO_BATCHES,
-            'cleaning': {
-                'missing_value_strategy': 'median',
-                'outlier_strategy': 'iqr'
-            },
-            'analysis': {
-                'time_column': None,
-                'target_column': None
+            'streaming': {
+                'work_dir': 'data/stream_checkpoints',
+                'checkpoint_interval_rows': 5000000,
+                'max_retries': 3,
+                'max_rows': 50000000,
+                'max_gb': 20,
+                'sample_ratio': 1.0,
             },
             'load_analysis': {
                 'time_window': 60,
-                'top_n_devices': None,
-                'hotspot_threshold': 100
+                'hotspot_threshold': 100,
             },
             'prediction': {
                 'targets': ['iops', 'throughput_kb'],
-                'models': ['linear', 'ridge', 'ar1', 'exp_smoothing',
-                           'random_forest', 'gradient_boosting', 'trend', 'moving_avg'],
-                'n_lags': None,
-                'predict_steps': 2
-            }
+                'predict_steps': 2,
+            },
         }
 
         if config_file and os.path.exists(config_file):
@@ -95,167 +86,224 @@ class DataCleaningPipeline:
 
         return default_config
 
-    def initialize_components(self):
-        """初始化各组件"""
-        self.downloader = OSSDataProcessor(
-            self.config['oss_url'],
-            max_retries=self.config['max_retries']
-        )
-        self.preprocessor = DataPreprocessor(self.config.get('cleaning', {}))
-        self.analyzer = DataAnalyzer()
-        self.load_analyzer = DeviceLoadAnalyzer(self.config.get('load_analysis', {}))
-        self.predictor = TimeSeriesPredictor(self.config.get('prediction', {}))
-        logger.info("组件初始化完成")
-
-    def check_existing_data(self):
-        """检查是否存在已下载的数据"""
-        if self.config['download_mode'] == 'partial':
-            expected_file = os.path.join(
-                self.raw_data_dir,
-                f"partial_{self.config['partial_start_gb']}gb_to_{self.config['partial_end_gb']}gb.tar.gz"
-            )
-            if os.path.exists(expected_file):
-                logger.info(f"发现已下载的数据文件: {expected_file}")
-                return expected_file
-        else:
-            processed_files = glob.glob(os.path.join(self.processed_data_dir, "cleaned_data_*.csv"))
-            if processed_files:
-                latest_file = max(processed_files, key=os.path.getmtime)
-                logger.info(f"发现已处理的数据文件: {latest_file}")
-                return latest_file
-        return None
-
-    def download_data(self):
-        """下载数据"""
-        existing_data = self.check_existing_data()
-        if existing_data:
-            logger.info("使用已下载的数据，跳过下载步骤")
-            return existing_data
-
-        download_mode = self.config['download_mode']
-
-        if download_mode == 'stream':
-            logger.info("使用流式处理模式")
-            return True
-        elif download_mode == 'partial':
-            output_file = os.path.join(
-                self.raw_data_dir,
-                f"partial_{self.config['partial_start_gb']}gb_to_{self.config['partial_end_gb']}gb.tar.gz"
-            )
-            try:
-                self.downloader.download_partial(
-                    self.config['partial_start_gb'],
-                    self.config['partial_end_gb'],
-                    output_file
-                )
-                logger.info("部分数据下载完成")
-                return output_file
-            except Exception as e:
-                logger.error(f"下载失败: {e}")
-                return False
-        else:
-            logger.error(f"不支持的下载模式: {download_mode}")
-            return False
-
-    def clean_data(self, data_chunk):
-        """清洗数据"""
-        return self.preprocessor.run_pipeline(
-            data_chunk,
-            time_column=self.config['analysis'].get('time_column'),
-            target_column=self.config['analysis'].get('target_column')
-        )
-
-    def analyze_data(self, data):
-        """分析数据"""
-        self.analyzer.comprehensive_analysis(
-            data,
-            time_column=self.config['analysis'].get('time_column')
-        )
-
-    def analyze_device_load(self, raw_df, save_dir=None):
-        """设备负载分析"""
-        if save_dir is None:
-            save_dir = os.path.join(self.output_dir, 'device_analysis')
-        return self.load_analyzer.run_full_analysis(raw_df, save_dir=save_dir)
-
     # ================================================================
-    # 独立预测步骤（可反复重跑）
+    # ================================================================
+    # 流式处理 — 两阶段 API
+    #   阶段1 (aggregate): 下载 + 增量聚合 → 保存 CSV/JSON → data/device_analysis/
+    #   阶段2 (visualize): 加载聚合数据(data/) → 图表 + 报告(output/device_analysis/) + 预测(output/prediction/)
+    #   每次阶段2 可基于阶段1的结果反复重跑
     # ================================================================
 
-    def run_prediction(self):
+    def _get_streaming_config(self):
+        """获取流式处理合并后的配置"""
+        streaming_config = self.config.get('streaming', {})
+        load_config = self.config.get('load_analysis', {})
+        # max_gb: 累计目标总量（如 20GB），跨运行累积
+        max_gb = streaming_config.get('max_gb', 0)
+        if max_gb <= 0:
+            max_gb = self.config.get('max_gb', 0)
+        if max_gb <= 0:
+            max_gb = self.config.get('partial_end_gb', 0)
+        # max_gb_incremental: 本次运行增量目标（如 0.1GB），
+        # 每次运行只处理这么多，checkpoint 累计到 max_gb 为止
+        max_gb_incremental = streaming_config.get('max_gb_incremental', 0)
+        return {
+            'max_retries': streaming_config.get('max_retries', self.config.get('max_retries', 3)),
+            'chunk_size_mb': streaming_config.get('download_chunk_mb', 10),
+            'checkpoint_interval_rows': streaming_config.get('checkpoint_interval_rows', 5000000),
+            'load_analysis': load_config,
+            # 优化参数
+            'max_rows': streaming_config.get('max_rows', 0),
+            'max_gb': max_gb,
+            'max_gb_incremental': max_gb_incremental,
+            'sample_ratio': streaming_config.get('sample_ratio', 1.0),
+            'top_device_ts': streaming_config.get('top_device_ts', 50),
+            'skip_second_dist': streaming_config.get('skip_second_dist', False),
+        }
+
+    def run_aggregate(self):
         """
-        独立的负载预测步骤 — 可反复重跑
+        阶段1: 流式下载 + 增量聚合 → 保存聚合数据（CSV/JSON）
 
-        从 data/processed/processed_io_traces*.csv 加载原始 I/O 数据，
-        自动指定列名并构造 datetime 列，然后调用 TimeSeriesPredictor。
+        完成后提示：
+          "聚合完成！共 X 行 Y 设备。请运行 --stage 2 进行可视化。"
 
         Returns:
-            预测目录路径，失败返回 None
+            True 成功 / False 失败
         """
-        io_chunks = sorted(glob.glob(
-            os.path.join(self.processed_data_dir, 'processed_io_traces*.csv')
-        ))
+        from src.data_download.streaming_processor import StreamingTarProcessor
 
-        if io_chunks:
-            logger.info(f"从 {len(io_chunks)} 个 I/O 轨迹块加载数据...")
-            chunks = []
-            for f in io_chunks:
-                # CSV 无表头，指定 header=None
-                df_chunk = pd.read_csv(f, low_memory=False, header=None)
-                chunks.append(df_chunk)
-            df = pd.concat(chunks, ignore_index=True)
-            # 指定列名：序号, R/W, device_id, size, timestamp, ...
-            col_count = df.shape[1]
-            names = ['row_idx', 'operation', 'device_id', 'size', 'timestamp']
-            if col_count > 5:
-                names += [f'col_{i}' for i in range(5, col_count)]
-            df.columns = names
-            logger.info(f"已指定列名: {names[:5]}")
-        else:
-            cleaned_files = sorted(glob.glob(
-                os.path.join(self.processed_data_dir, 'cleaned_data_*.csv')
-            ))
-            if not cleaned_files:
-                logger.error("没有找到 I/O 轨迹数据，请先运行 load_analysis")
-                return None
-            logger.info(f"使用合并数据: {cleaned_files[-1]}")
-            df = pd.read_csv(cleaned_files[-1], low_memory=False)
+        streaming_config = self.config.get('streaming', {})
+        work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
+        url = self.config['oss_url']
+        full_config = self._get_streaming_config()
+        max_rows = full_config.get('max_rows', 0)
 
-        logger.info(f"预测数据: {len(df)} 行")
+        device_analysis_dir = os.path.join('data', 'device_analysis')
+        processor = StreamingTarProcessor(url, work_dir, full_config, output_dir=device_analysis_dir)
+        self.streaming_processor = processor
 
-        # 构造 datetime 列
-        if 'datetime' not in df.columns and 'timestamp' in df.columns:
-            for unit in ['us', 'ms', 's']:
+        try:
+            logger.info("=" * 60)
+            logger.info("【阶段1】流式聚合分析 — 边下载边处理（不落盘）")
+            logger.info("=" * 60)
+            logger.info(f"目标 URL: {url}")
+            logger.info(f"工作目录: {work_dir}")
+            logger.info(f"输出目录: {self.output_dir}")
+            max_gb = full_config.get('max_gb', 0)
+            max_gb_inc = full_config.get('max_gb_incremental', 0)
+            if max_gb > 0:
+                logger.info(f"累计目标: {max_gb} GB（checkpoint 跨运行累积）")
+            if max_gb_inc > 0:
+                logger.info(f"本次增量: {max_gb_inc} GB")
+            if max_rows > 0:
+                logger.info(f"目标行数: {max_rows:,}")
+            sample_ratio = full_config.get('sample_ratio', 1.0)
+            if sample_ratio < 1.0:
+                logger.info(f"采样率: {sample_ratio:.0%}")
+
+            def _progress_callback(bytes_dl, total_size, rows_processed, phase='stream'):
+                if total_size > 1:
+                    progress_pct = (bytes_dl / total_size * 100)
+                    logger.info(f"  [{progress_pct:.1f}%] {format_bytes(bytes_dl)}/"
+                                f"{format_bytes(total_size)} | 已聚合: {rows_processed:,} 行")
+                else:
+                    logger.info(f"  [下载] {format_bytes(bytes_dl)} | 已聚合: {rows_processed:,} 行")
+
+            results = processor.process(progress_callback=_progress_callback)
+            total_rows = results.get('total_rows_processed', 0)
+            total_devices = results.get('total_devices', 0)
+
+            if total_rows == 0:
+                logger.error("流式处理未产生任何数据")
+                return False
+
+            # 最终保存聚合数据（增量保存已持续更新，这里做最终完整覆盖）
+            processor.save_aggregation(device_analysis_dir)
+
+            logger.info("=" * 60)
+            logger.info("【阶段1 完成】")
+            logger.info(f"  聚合行数: {total_rows:,}")
+            logger.info(f"  设备数量: {total_devices}")
+            logger.info(f"  数据位置: {device_analysis_dir}")
+            logger.info("")
+            logger.info("  >>> 下一步: python data_processing_pipeline.py --stage 2")
+            logger.info("  >>> （生成图表 + 负载预测，可反复重跑）")
+            logger.info("=" * 60)
+
+            return True
+
+        except KeyboardInterrupt:
+            logger.info("\n用户中断，checkpoint 已保存。恢复: --resume")
+            return False
+        except Exception as e:
+            logger.error(f"聚合失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def run_visualize_and_predict(self):
+        """
+        阶段2: 加载已聚合数据 → 生成图表 + 报告 + 负载预测
+
+        基于阶段1的结果，可反复重跑，无需重新下载。
+        """
+        from src.data_download.streaming_processor import StreamingTarProcessor
+
+        streaming_config = self.config.get('streaming', {})
+        work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
+        url = self.config['oss_url']
+
+        # 检查聚合数据是否存在（阶段1输出在 data/device_analysis/）
+        data_dir = os.path.join('data', 'device_analysis')
+        ts_global_path = os.path.join(data_dir, 'time_series_global.csv')
+
+        if not os.path.exists(ts_global_path):
+            logger.error(f"聚合数据不存在: {ts_global_path}")
+            logger.error("请先运行阶段1: python data_processing_pipeline.py --stage 1")
+            return False
+
+        # 可视化输出到 output/device_analysis/
+        viz_dir = os.path.join(self.output_dir, 'device_analysis')
+
+        processor = StreamingTarProcessor(url, work_dir, self._get_streaming_config())
+
+        try:
+            # ---- 可视化 + 报告 ----
+            logger.info("=" * 60)
+            logger.info("【阶段2】可视化 + 报告生成")
+            logger.info("=" * 60)
+
+            results = processor.generate_visualization(data_dir, viz_dir)
+            if results is None:
+                return False
+
+            ts_global = results.get('time_series_global')
+
+            # ---- 负载预测 ----
+            logger.info("=" * 60)
+            logger.info("【阶段2】负载预测")
+            logger.info("=" * 60)
+
+            if ts_global is not None and len(ts_global) >= 10:
                 try:
-                    df['datetime'] = pd.to_datetime(df['timestamp'], unit=unit, errors='raise')
-                    logger.info(f"  datetime 构造成功 (unit={unit})")
-                    break
-                except Exception:
-                    pass
-            if 'datetime' not in df.columns:
-                logger.error("无法从 timestamp 构造 datetime 列")
-                return None
+                    prediction_dir = os.path.join(self.output_dir, 'prediction')
+                    os.makedirs(prediction_dir, exist_ok=True)
+                    self.predictor = TimeSeriesPredictor(self.config.get('prediction', {}))
+                    pred_config = self.config.get('prediction', {})
+                    targets = pred_config.get('targets', ['iops', 'throughput_kb'])
+                    models = pred_config.get('models', None)
+                    n_lags = pred_config.get('n_lags', None)
+                    predict_steps = pred_config.get('predict_steps', 2)
 
-        if len(df) < 10:
-            logger.error(f"数据量不足: {len(df)} < 10")
-            return None
+                    all_results = self.predictor.run_multi_target_prediction(
+                        ts_global, targets=targets, model_names=models,
+                        n_lags=n_lags, predict_steps=predict_steps
+                    )
+                    self.predictor.print_report(all_results)
+                    self.predictor.visualize_predictions(all_results, ts_global, prediction_dir)
+                    logger.info(f"预测完成: {prediction_dir}")
+                except Exception as e:
+                    logger.warning(f"预测失败（数据量可能不足）: {e}")
+            else:
+                logger.info(f"跳过预测：时间序列不足 ({len(ts_global) if ts_global is not None else 0} < 10)")
 
-        logger.info(f"数据准备完成: {len(df)} 行, 列: {list(df.columns[:6])}")
-
-        prediction_dir = os.path.join(self.output_dir, 'prediction')
-        os.makedirs(prediction_dir, exist_ok=True)
-
-        logger.info("=" * 60)
-        logger.info("开始负载预测")
-        logger.info("=" * 60)
-
-        result = self.predict_load(df, save_dir=prediction_dir)
-
-        if result:
             logger.info("=" * 60)
-            logger.info("负载预测完成")
+            logger.info("【阶段2 完成】")
+            logger.info(f"  图表报告: {viz_dir}")
+            logger.info(f"  预测结果: {prediction_dir if ts_global is not None and len(ts_global) >= 10 else '跳过'}")
             logger.info("=" * 60)
-        return prediction_dir if result else None
+
+            return True
+
+        except Exception as e:
+            logger.error(f"可视化/预测失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def run_streaming(self):
+        """
+        两阶段完整执行（兼容旧接口）。
+
+        流程：
+        1. 流式下载 + 增量聚合 — 边下载边提取分析，只保留聚合结果
+        2. 生成设备负载分析图表和报告
+        3. 运行负载预测（基于聚合后的时间序列）
+        """
+        # 先执行阶段1
+        if not self.run_aggregate():
+            logger.warning("阶段1 聚合失败或中断")
+            return False
+
+        # 再执行阶段2
+        if not self.run_visualize_and_predict():
+            logger.warning("阶段2 可视化/预测失败")
+            return False
+
+        return True
+
+
 
     # ================================================================
     # 回归测试（可反复重跑）
@@ -265,14 +313,14 @@ class DataCleaningPipeline:
         """
         运行回归测试 — 反复可重用的多模型回归性能评估
 
-        使用 device_analysis/device_profiles.csv 数据，对多个回归模型
+        使用 data/device_analysis/device_profiles.csv 数据，对多个回归模型
         (Linear, Ridge, RandomForest, GradientBoosting) 进行评估，
         生成偏差可视化图表和 HTML 报告，结果保存到 output/regression_analysis/。
 
         Returns:
             回归分析目录路径
         """
-        profiles_path = os.path.join(self.output_dir, 'device_analysis', 'device_profiles.csv')
+        profiles_path = os.path.join('data', 'device_analysis', 'device_profiles.csv')
         if not os.path.exists(profiles_path):
             logger.error(f"设备画像不存在: {profiles_path}，请先运行 load_analysis")
             return None
@@ -304,330 +352,104 @@ class DataCleaningPipeline:
         logger.info("=" * 60)
         return regression_dir
 
-    def predict_load(self, df_raw_io, save_dir=None):
+
+
+    def run(self, steps=None, max_batches=None, stage=None):
         """
-        基于原始 I/O 数据进行回归预测
+        运行数据处理管道（仅流式模式）。
 
         Args:
-            df_raw_io: 原始 I/O 轨迹 DataFrame
-            save_dir: 可视化保存目录
-
-        Returns:
-            prediction_results: dict
+            stage: 1=聚合, 2=可视化+预测, 默认=1+2
         """
-        if self.predictor is None:
-            self.predictor = TimeSeriesPredictor(self.config.get('prediction', {}))
-
-        pred_config = self.config.get('prediction', {})
-        targets = pred_config.get('targets', ['iops', 'throughput_kb'])
-        models = pred_config.get('models', None)
-        n_lags = pred_config.get('n_lags', None)
-        predict_steps = pred_config.get('predict_steps', 2)
-
-        if save_dir is None:
-            save_dir = os.path.join(self.output_dir, 'prediction')
-        os.makedirs(save_dir, exist_ok=True)
-
-        logger.info("=" * 60)
-        logger.info(f"开始负载预测: 目标={targets}, 预测步数={predict_steps}")
-        logger.info("=" * 60)
-
-        # ---- 数据预处理：确保包含必要列 ----
-        df = df_raw_io.copy()
-        required_cols = {'datetime', 'operation', 'device_id', 'size'}
-        missing = required_cols - set(df.columns)
-        if missing:
-            logger.warning(f"数据缺少列 {missing}，尝试自动推断...")
-            cols = list(df.columns)
-            # 尝试推断 operation 列（第2列，值为 R/W）
-            if 'operation' not in df.columns and len(cols) > 1:
-                sample = str(df.iloc[0, 1]) if len(df) > 0 else ''
-                if sample.upper() in ['R', 'W']:
-                    df = df.rename(columns={df.columns[1]: 'operation'})
-                    missing.discard('operation')
-            # 推断 device_id（第3列，大整数）
-            if 'device_id' not in df.columns and len(cols) > 2:
-                try:
-                    df = df.rename(columns={df.columns[2]: 'device_id'})
-                    missing.discard('device_id')
-                except Exception:
-                    pass
-            # 推断 size（第4列，整数/浮点数）
-            if 'size' not in df.columns and len(cols) > 3:
-                try:
-                    df = df.rename(columns={df.columns[3]: 'size'})
-                    missing.discard('size')
-                except Exception:
-                    pass
-            # 从 timestamp 构造 datetime
-            if 'datetime' not in df.columns and 'timestamp' in df.columns:
-                logger.info("从 timestamp 列构造 datetime...")
-                ts_col = df['timestamp']
-                # 尝试毫秒/微秒/秒
-                for unit in ['ms', 'us', 's']:
-                    try:
-                        df['datetime'] = pd.to_datetime(ts_col, unit=unit, errors='raise')
-                        logger.info(f"  datetime 构造成功 (unit={unit})")
-                        missing.discard('datetime')
-                        break
-                    except Exception:
-                        pass
-            if missing:
-                logger.error(f"数据仍缺少必要列: {missing}，当前列: {list(df.columns)}")
-                logger.error("请确保传入的是原始 I/O 轨迹数据（含 datetime/timestamp 列）")
-                return None
-
-        # 确保数据量足够
-        if len(df) < 10:
-            logger.error(f"数据量不足: {len(df)} < 10")
-            return None
-
-        logger.info(f"预测数据: {len(df)} 行, 列: {list(df.columns[:8])}")
-
-        try:
-            all_results = self.predictor.run_multi_target_prediction(
-                df, targets=targets, model_names=models,
-                n_lags=n_lags, predict_steps=predict_steps
-            )
-
-            # 打印报告
-            self.predictor.print_report(all_results)
-
-            # 生成可视化
-            self.predictor.visualize_predictions(all_results, df, save_dir)
-
-            logger.info(f"预测完成，结果保存至: {save_dir}")
-            return all_results
-        except Exception as e:
-            logger.error(f"预测失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-
-    def _is_io_trace_data(self, df):
-        """判断数据是否为I/O轨迹数据"""
-        if len(df.columns) < 5:
-            return False
-        # 检查前5列中是否有R/W列
-        check_cols = df.iloc[:, :5] if len(df.columns) >= 5 else df
-        for i in range(len(check_cols.columns)):
-            unique_vals = check_cols.iloc[:, i].dropna().astype(str).unique()
-            if len(unique_vals) <= 2 and any(v.upper() in ['R', 'W'] for v in unique_vals):
-                return True
-        return False
-
-    def _check_data_quality(self, data):
-        """检查数据处理质量 (0-1)"""
-        non_null_ratio = data.notnull().mean().mean()
-        numeric_cols = data.select_dtypes(include=[np.number]).columns
-        range_score = 0
-        if len(numeric_cols) > 0:
-            for col in numeric_cols:
-                q1 = data[col].quantile(0.25)
-                q3 = data[col].quantile(0.75)
-                iqr = q3 - q1
-                lower_bound = q1 - 1.5 * iqr
-                upper_bound = q3 + 1.5 * iqr
-                outlier_ratio = ((data[col] < lower_bound) | (data[col] > upper_bound)).mean()
-                range_score += (1 - outlier_ratio)
-            range_score /= len(numeric_cols)
+        if stage == 1:
+            return self.run_aggregate()
+        elif stage == 2:
+            return self.run_visualize_and_predict()
         else:
-            range_score = 1
-        return (non_null_ratio + range_score) / 2
+            return self.run_streaming()
 
-    def process_data(self, max_batches=None):
-        """
-        处理数据
+    def resume(self):
+        """从 checkpoint 恢复阶段1聚合（断点续传）"""
+        from src.data_download.streaming_processor import CheckpointManager
 
-        流程: 自动执行 auto_batches（默认5）个批次，单批次仅日志+清洗+保存中间结果，
-        不做可视化。所有批次完成后，合并原始I/O数据执行设备负载分析并输出可视化。
-        """
-        auto_batches = max_batches or self.config.get('auto_batches', DEFAULT_AUTO_BATCHES)
-        processed_data = []
-        raw_io_traces = []
-        batch_count = 0
+        streaming_config = self.config.get('streaming', {})
+        work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
+        checkpoint = CheckpointManager(work_dir)
 
-        def processing_callback(data_chunk, filename, chunk_num):
-            """处理回调：清洗 + 日志统计，不做可视化"""
-            nonlocal batch_count
-            batch_count += 1
+        if not checkpoint.exists():
+            logger.info("没有发现 checkpoint，将重新开始聚合")
+            return self.run_aggregate()
 
-            logger.info(f"[批次 {batch_count}/{auto_batches}] {filename} - 块 {chunk_num}, "
-                        f"行数: {len(data_chunk)}")
+        logger.info("从 checkpoint 恢复聚合...")
+        return self.run_aggregate()
 
-            # 收集原始I/O轨迹数据
-            if 'io_traces' in filename.lower() or self._is_io_trace_data(data_chunk):
-                raw_io_traces.append(data_chunk.copy())
+    def clear_checkpoint(self):
+        """清除流式处理的 checkpoint（从头开始）"""
+        from src.data_download.streaming_processor import CheckpointManager
 
-            # 清洗数据
-            cleaned_chunk = self.clean_data(data_chunk)
+        streaming_config = self.config.get('streaming', {})
+        work_dir = streaming_config.get('work_dir', 'data/stream_checkpoints')
+        checkpoint = CheckpointManager(work_dir)
+        checkpoint.clear()
 
-            # 简要分析（仅打印统计摘要）
-            self.analyze_data(cleaned_chunk)
+        # 同时清理临时下载文件
+        temp_file = os.path.join(work_dir, 'streaming_temp.tar.gz')
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+            logger.info(f"已清理临时文件: {temp_file}")
 
-            processed_data.append(cleaned_chunk)
-
-            # 保存中间结果
-            intermediate_file = os.path.join(
-                self.processed_data_dir,
-                f"processed_{os.path.basename(filename)}_chunk{chunk_num}.csv"
-            )
-            cleaned_chunk.to_csv(intermediate_file, index=False)
-
-            quality_score = self._check_data_quality(cleaned_chunk)
-            logger.info(f"  质量得分: {quality_score:.2f}, "
-                        f"清洗后: {len(cleaned_chunk)} 行, "
-                        f"设备数: {cleaned_chunk.iloc[:, 0].nunique() if len(cleaned_chunk) > 0 else 0}")
-
-            # 达到目标批次数自动停止
-            if batch_count >= auto_batches:
-                logger.info(f"已自动完成 {auto_batches} 个批次，准备合并分析")
-                return False
-
-            return True
-
-        # ---- 执行处理 ----
-        try:
-            if self.config['download_mode'] == 'partial':
-                local_file = os.path.join(
-                    self.raw_data_dir,
-                    f"partial_{self.config['partial_start_gb']}gb_to_{self.config['partial_end_gb']}gb.tar.gz"
-                )
-                if os.path.exists(local_file):
-                    logger.info(f"处理本地文件: {local_file}")
-                    self.downloader.stream_process(
-                        processing_callback,
-                        chunk_size_mb=self.config['chunk_size_mb'],
-                        local_file=local_file
-                    )
-                else:
-                    logger.error(f"本地文件不存在: {local_file}")
-                    return None
-            else:
-                self.downloader.stream_process(
-                    processing_callback,
-                    chunk_size_mb=self.config['chunk_size_mb']
-                )
-
-            # ---- 合并处理后的数据 ----
-            combined_df = None
-            if processed_data:
-                combined_df = pd.concat(processed_data, ignore_index=True)
-                output_file = os.path.join(
-                    self.processed_data_dir,
-                    f"cleaned_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                )
-                combined_df.to_csv(output_file, index=False)
-                logger.info(f"清洗后合并数据已保存: {output_file}")
-
-            # ---- 设备负载分析 + 可视化 ----
-            ts_global = None
-            raw_combined = None
-            if raw_io_traces:
-                logger.info(f"合并 {len(raw_io_traces)} 个批次的I/O轨迹数据进行负载分析...")
-                raw_combined = pd.concat(raw_io_traces, ignore_index=True)
-                load_analysis_dir = os.path.join(self.output_dir, 'device_analysis')
-                try:
-                    self.load_analyzer.run_full_analysis(raw_combined, save_dir=load_analysis_dir)
-                    # 获取全局时间序列用于预测
-                    ts_global = self.load_analyzer.analysis_results.get('time_series_global')
-                except KeyError as e:
-                    logger.error(f"负载分析失败，列名不匹配: {e}")
-                    logger.info(f"原始数据列名: {list(raw_combined.columns)}, 类型: {[type(c).__name__ for c in raw_combined.columns]}")
-                except Exception as e:
-                    logger.error(f"负载分析失败: {e}")
-
-            # ---- 负载预测 ----
-            if raw_combined is not None and len(raw_combined) >= 100:
-                try:
-                    prediction_dir = os.path.join(self.output_dir, 'prediction')
-                    self.predict_load(raw_combined, save_dir=prediction_dir)
-                except Exception as e:
-                    logger.error(f"负载预测失败: {e}")
-
-            return output_file if combined_df is not None else None
-
-        except Exception as e:
-            logger.error(f"处理数据失败: {e}")
-            return None
-
-    def run(self, steps=None, max_batches=None):
-        """
-        运行数据清洗管道
-
-        Args:
-            steps: 要运行的步骤列表 ['download', 'clean', 'analyze', 'visualize',
-                   'load_analysis', 'predict']
-            max_batches: 最大处理批次数量，默认自动执行 auto_batches(5) 个批次
-        """
-        if steps is None:
-            steps = ['download', 'clean', 'analyze', 'visualize', 'load_analysis', 'predict']
-
-        try:
-            self.initialize_components()
-
-            if 'download' in steps:
-                download_result = self.download_data()
-                if not download_result:
-                    logger.error("数据下载失败")
-                    return False
-
-            if 'clean' in steps or 'analyze' in steps or 'visualize' in steps \
-                    or 'load_analysis' in steps:
-                output_file = self.process_data(max_batches=max_batches)
-                if output_file:
-                    logger.info(f"处理完成，输出文件: {output_file}")
-                elif 'load_analysis' not in steps:
-                    logger.error("数据处理失败")
-                    return False
-                else:
-                    logger.info("数据处理阶段完成（仅分析/预测模式）")
-
-            # 预测步骤（独立可重跑）
-            if 'predict' in steps:
-                pred_dir = self.run_prediction()
-                if pred_dir:
-                    logger.info(f"预测完成，结果保存在: {pred_dir}")
-                else:
-                    logger.warning("预测步骤未产生结果")
-
-            # 回归测试步骤（可独立重跑）
-            if 'regression_test' in steps:
-                reg_dir = self.run_regression_test()
-                if reg_dir:
-                    logger.info(f"回归测试完成，结果保存在: {reg_dir}")
-                else:
-                    logger.warning("回归测试未产生结果")
-
-            return True
-        except Exception as e:
-            logger.error(f"运行失败: {e}")
-            return False
-        finally:
-            if self.downloader:
-                self.downloader.cleanup()
+        logger.info("Checkpoint 已清除，下次运行将从头开始")
 
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='数据清洗管道')
-    parser.add_argument('--config', help='配置文件路径')
-    parser.add_argument('--url', help='OSS文件URL')
-    parser.add_argument('--mode', choices=['stream', 'partial'], help='下载模式')
-    parser.add_argument('--output', help='输出目录')
-    parser.add_argument('--steps', nargs='+',
-                        choices=['download', 'clean', 'analyze', 'visualize',
-                                 'load_analysis', 'predict', 'regression_test'],
-                        help='要运行的步骤列表')
-    parser.add_argument('--max-batches', type=int, help='最大处理批次数量')
-    parser.add_argument('--auto-batches', type=int,
-                        help=f'自动执行的批次数（默认{DEFAULT_AUTO_BATCHES}）')
+    parser = argparse.ArgumentParser(
+        description='大数据处理管道 — 两阶段流式处理 20GB+ 文件',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 阶段1: 下载+聚合（断点续传，约20GB=50M行）
+  python data_processing_pipeline.py --stage 1 --max-rows 50000000
+
+  # 阶段2: 可视化+预测（基于阶段1结果，可反复重跑）
+  python data_processing_pipeline.py --stage 2
+
+  # 一键跑完阶段1+2
+  python data_processing_pipeline.py --max-rows 50000000
+
+  # 从 checkpoint 恢复阶段1
+  python data_processing_pipeline.py --resume
+
+  # 清除 checkpoint 重新开始
+  python data_processing_pipeline.py --clear-checkpoint
+
+  # 50% 采样加速测试
+  python data_processing_pipeline.py --stage 1 --sample-ratio 0.5
+        """
+    )
+    parser.add_argument('--config', help='配置文件路径（默认 config.json）')
+    parser.add_argument('--url', help='OSS 文件 URL')
+    parser.add_argument('--output', help='输出目录（默认 output）')
+    parser.add_argument('--stage', type=int, choices=[1, 2],
+                        help='阶段: 1=聚合, 2=可视化+预测（默认全部）')
+    parser.add_argument('--max-rows', type=int,
+                        help='最大处理行数')
+    parser.add_argument('--max-gb', type=float,
+                        help='最大下载量 GB（默认 20）')
+    parser.add_argument('--sample-ratio', type=float,
+                        help='采样率 0~1')
     parser.add_argument('--predict-steps', type=int,
-                        help='预测步数（默认2，即预测后2个时间窗口）')
+                        help='预测步数（默认 2）')
     parser.add_argument('--predict-targets', nargs='+',
                         help='预测目标指标列表')
+    parser.add_argument('--resume', action='store_true',
+                        help='从 checkpoint 恢复阶段1聚合')
+    parser.add_argument('--clear-checkpoint', action='store_true',
+                        help='清除 checkpoint，从头开始')
+    parser.add_argument('--work-dir', help='checkpoint 存放位置')
+    parser.add_argument('--checkpoint-interval', type=int,
+                        help='每多少行保存 checkpoint（默认 500万）')
 
     args = parser.parse_args()
 
@@ -635,23 +457,41 @@ def main():
 
     if args.url:
         pipeline.config['oss_url'] = args.url
-    if args.mode:
-        pipeline.config['download_mode'] = args.mode
     if args.output:
         pipeline.config['output_dir'] = args.output
-    if args.auto_batches:
-        pipeline.config['auto_batches'] = args.auto_batches
     if args.predict_steps:
-        pipeline.config['prediction']['predict_steps'] = args.predict_steps
+        pipeline.config.setdefault('prediction', {})['predict_steps'] = args.predict_steps
     if args.predict_targets:
-        pipeline.config['prediction']['targets'] = args.predict_targets
+        pipeline.config.setdefault('prediction', {})['targets'] = args.predict_targets
 
-    success = pipeline.run(steps=args.steps, max_batches=args.max_batches)
+    # 流式优化参数
+    pipeline.config.setdefault('streaming', {})
+    if args.work_dir:
+        pipeline.config['streaming']['work_dir'] = args.work_dir
+    if args.checkpoint_interval:
+        pipeline.config['streaming']['checkpoint_interval_rows'] = args.checkpoint_interval
+    if args.max_rows:
+        pipeline.config['streaming']['max_rows'] = args.max_rows
+    if args.max_gb:
+        pipeline.config['streaming']['max_gb_incremental'] = args.max_gb
+    if args.sample_ratio is not None:
+        pipeline.config['streaming']['sample_ratio'] = args.sample_ratio
+
+    # ---- 特殊命令 ----
+    if args.clear_checkpoint:
+        pipeline.clear_checkpoint()
+        logger.info("Checkpoint 已清除")
+        return
+
+    if args.resume:
+        success = pipeline.resume()
+    else:
+        success = pipeline.run(stage=args.stage)
 
     if success:
-        logger.info("数据清洗管道执行成功")
+        logger.info("管道执行成功")
     else:
-        logger.error("数据清洗管道执行失败")
+        logger.error("管道执行失败")
 
 
 if __name__ == "__main__":
