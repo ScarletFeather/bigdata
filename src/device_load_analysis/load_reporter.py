@@ -63,36 +63,64 @@ class LoadReporter:
         print("=" * 60)
 
     def save_results(self, analysis_results, save_dir=None):
-        """保存分析结果到文件"""
+        """保存分析结果到文件（原子性写入：先写临时文件再 rename）"""
         save_dir = save_dir or self.save_dir
         if not save_dir:
             logger.warning("未指定保存目录，跳过保存")
             return
         os.makedirs(save_dir, exist_ok=True)
 
+        saved_count = 0
+        failed_items = []
+
         for key, data in analysis_results.items():
-            if isinstance(data, pd.DataFrame):
-                filepath = os.path.join(save_dir, f'{key}.csv')
-                data.to_csv(filepath, index=False)
-                logger.info(f"保存: {filepath}")
-            elif isinstance(data, dict):
-                filepath = os.path.join(save_dir, f'{key}.json')
-                serializable = {}
-                for k, v in data.items():
-                    if isinstance(v, (np.integer,)):
-                        serializable[k] = int(v)
-                    elif isinstance(v, (np.floating,)):
-                        serializable[k] = float(v)
-                    elif isinstance(v, np.ndarray):
-                        serializable[k] = v.tolist()
-                    elif isinstance(v, dict):
-                        serializable[k] = {str(kk): (int(vv) if isinstance(vv, (np.integer,)) else vv)
-                                           for kk, vv in v.items()}
-                    else:
-                        serializable[k] = v
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(serializable, f, ensure_ascii=False, indent=2)
-                logger.info(f"保存: {filepath}")
+            try:
+                if isinstance(data, pd.DataFrame):
+                    filepath = os.path.join(save_dir, f'{key}.csv')
+                    # 原子性写入：先写临时文件再 rename
+                    tmp_path = filepath + '.tmp'
+                    data.to_csv(tmp_path, index=False)
+                    os.replace(tmp_path, filepath)
+                    logger.info(f"保存: {filepath} ({len(data)} 行)")
+                    saved_count += 1
+                elif isinstance(data, dict):
+                    filepath = os.path.join(save_dir, f'{key}.json')
+                    serializable = {}
+                    for k, v in data.items():
+                        if isinstance(v, (np.integer,)):
+                            serializable[k] = int(v)
+                        elif isinstance(v, (np.floating,)):
+                            serializable[k] = float(v)
+                        elif isinstance(v, np.ndarray):
+                            serializable[k] = v.tolist()
+                        elif isinstance(v, dict):
+                            serializable[k] = {str(kk): (int(vv) if isinstance(vv, (np.integer,)) else vv)
+                                               for kk, vv in v.items()}
+                        else:
+                            serializable[k] = v
+                    # 原子性写入：先写临时文件再 rename
+                    tmp_path = filepath + '.tmp'
+                    with open(tmp_path, 'w', encoding='utf-8') as f:
+                        json.dump(serializable, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, filepath)
+                    logger.info(f"保存: {filepath}")
+                    saved_count += 1
+            except Exception as e:
+                logger.error(f"保存 {key} 失败: {e}")
+                failed_items.append(key)
+                # 清理可能残留的临时文件
+                tmp_path = os.path.join(save_dir, f'{key}.csv.tmp')
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                tmp_path = os.path.join(save_dir, f'{key}.json.tmp')
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        if failed_items:
+            logger.warning(f"保存完成: {saved_count}/{saved_count + len(failed_items)} 成功, "
+                          f"失败项: {failed_items}")
+        else:
+            logger.info(f"全部 {saved_count} 项保存成功")
 
     # ================================================================
     # 服务器负载可视化

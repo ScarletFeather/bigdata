@@ -425,8 +425,8 @@ class IncrementalAggregator:
         self.total_read = state.get('global', {}).get('total_read', 0)
         self.total_write = state.get('global', {}).get('total_write', 0)
         self.hour_global = defaultdict(int, state.get('global', {}).get('hour_global', {}))
-        self.minute_global = defaultdict(str, state.get('global', {}).get('minute_global', {}))
-        self.second_global = defaultdict(str, state.get('global', {}).get('second_global', {}))
+        self.minute_global = defaultdict(int, state.get('global', {}).get('minute_global', {}))
+        self.second_global = defaultdict(int, state.get('global', {}).get('second_global', {}))
         self.size_welford = state.get('global', {}).get('size_welford',
                                                         {'count': 0, 'mean': 0.0, 'M2': 0.0})
 
@@ -463,7 +463,11 @@ class IncrementalAggregator:
 
         for dev_str, ts_data in state.get('ts_device', {}).items():
             dev_id = int(dev_str)
-            self.ts_device[dev_id] = defaultdict(dict)
+            # 使用与 reset() 相同的 lambda 工厂函数，确保新时间窗口有默认值
+            self.ts_device[dev_id] = defaultdict(lambda: {
+                'total_count': 0, 'read_count': 0, 'write_count': 0,
+                'total_size_kb': 0.0, 'sum_size_kb': 0.0,
+            })
             for wk_str, v in ts_data.items():
                 wk = int(wk_str)
                 self.ts_device[dev_id][wk] = dict(v)
@@ -977,10 +981,8 @@ class StreamingTarProcessor:
                                 self.decompressed_bytes += actual_bytes  # 用实际读取字节数
                                 self.aggregator.processed_members.append(member.name)
 
-                                # 定期保存 checkpoint（checkpoint 文件在 stream_checkpoints/，仅恢复用）
-                                if rows_since_checkpoint >= self.checkpoint_interval_rows:
-                                    self._save_checkpoint()
-                                    rows_since_checkpoint = 0
+                                # 定期保存 checkpoint 已移除：仅在阶段1全部完成后保存最终 checkpoint
+                                # rows_since_checkpoint 仅用于 finally 块判断是否有新数据
 
                                 # 增量保存分析结果到 data/device_analysis/（用户可见）
                                 # 第一个成员处理完立即保存；后续每 200 万行
@@ -1005,7 +1007,6 @@ class StreamingTarProcessor:
                                 max_rows_val = self.aggregator.max_rows
                                 if max_rows_val > 0 and self.aggregator.total_rows >= max_rows_val:
                                     logger.info(f"已达目标行数 {max_rows_val:,}，停止处理")
-                                    self._save_checkpoint()
                                     return
                                 # 本次增量限制（优先级最高）
                                 if max_inc_bytes > 0 and (self.decompressed_bytes - decomp_at_start) >= max_inc_bytes:
@@ -1013,15 +1014,12 @@ class StreamingTarProcessor:
                                     cum = self.decompressed_bytes / (1024**3)
                                     logger.info(f"本次增量已达 {max_gb_incremental:.2f} GB "
                                                 f"（本次实际 {run_done:.3f} GB，累计 {cum:.3f} GB），停止处理")
-                                    self._save_checkpoint()
                                     return
                                 # 总量限制（兜底检查）
                                 if max_total_bytes > 0 and self.decompressed_bytes >= max_total_bytes:
                                     logger.info(f"累计已达总量目标 {max_gb_total:.2f} GB，停止处理")
-                                    self._save_checkpoint()
                                     return
                                 if not should_continue:
-                                    self._save_checkpoint()
                                     return
 
                             elif member.isfile() and member.name.endswith('.json'):
@@ -1041,9 +1039,7 @@ class StreamingTarProcessor:
                     raise
             finally:
                 download_reader[0] = None  # 停止进度线程
-                # 最终 checkpoint
-                if rows_since_checkpoint > 0:
-                    self._save_checkpoint()
+                # 中间 checkpoint 已移除，最终 checkpoint 在 save_aggregation() 中保存
 
     def _process_tar_member(self, tar: tarfile.TarFile, member: tarfile.TarInfo,
                             max_inc_bytes=0, max_gb_inc=0, decomp_at_start=0):
@@ -1134,14 +1130,17 @@ class StreamingTarProcessor:
             return True, 0
 
     def _save_checkpoint(self):
-        """保存当前 checkpoint"""
-        state = {
-            'total_bytes_downloaded': self.bytes_downloaded,
-            'decompressed_bytes': self.decompressed_bytes,
-            'total_file_size': self.total_file_size,
-            'aggregator': self.aggregator.to_checkpoint_state(),
-        }
-        self.checkpoint.save(state)
+        """保存当前 checkpoint（失败不中断主流程）"""
+        try:
+            state = {
+                'total_bytes_downloaded': self.bytes_downloaded,
+                'decompressed_bytes': self.decompressed_bytes,
+                'total_file_size': self.total_file_size,
+                'aggregator': self.aggregator.to_checkpoint_state(),
+            }
+            self.checkpoint.save(state)
+        except Exception as e:
+            logger.warning(f"Checkpoint 保存失败（不影响处理，下次将重新处理部分数据）: {e}")
 
     def _incremental_save(self):
         """增量保存当前分析结果到 output_dir（用户随时可查看）并释放内存"""
@@ -1160,7 +1159,9 @@ class StreamingTarProcessor:
             # 保存后立即裁剪 block_stats 释放内存（保留 Top 100k 热点 block）
             self.aggregator.prune_block_stats(max_entries=100000)
         except Exception as e:
-            logger.debug(f"增量保存跳过: {e}")
+            logger.warning(f"增量保存失败（不影响主流程，下次 checkpoint 重试）: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
 
     def _build_final_results(self) -> dict:
         """构建最终分析结果（仅保留阶段2需要的5个核心数据集）"""
@@ -1249,13 +1250,26 @@ class StreamingTarProcessor:
         reporter.print_summary(profiles, patterns, ts_global)
 
         # 仅保存数据文件（CSV/JSON），不生成图表
-        reporter.save_results(results, save_dir)
+        # 使用原子性保存：先保存到临时目录，成功后再移动
+        try:
+            reporter.save_results(results, save_dir)
+        except Exception as e:
+            logger.error(f"聚合数据保存失败，保留 checkpoint 以便恢复: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # 保存失败时不清理 checkpoint，保留恢复能力
+            return results
 
-        # 清理 checkpoint 及工作目录（断点续传用 checkpoint.json，无需额外 dump）
-        self.checkpoint.clear()
-        self._cleanup_work_dir()
-        self._cleanup_empty_data_dirs()
-        logger.info("中间文件已清理")
+        # 验证关键文件是否已成功写入
+        required_files = ['device_profiles.csv', 'time_series_global.csv', 'access_patterns.json']
+        missing = [f for f in required_files if not os.path.exists(os.path.join(save_dir, f))]
+        if missing:
+            logger.error(f"关键文件缺失: {missing}，保留 checkpoint 以便恢复")
+            return results
+
+        # 保存最终 checkpoint（保留，不删除，以便后续查看或恢复）
+        self._save_checkpoint()
+        logger.info("数据保存验证通过，最终 checkpoint 已保留")
 
         return results
 
