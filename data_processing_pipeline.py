@@ -70,7 +70,7 @@ class DataCleaningPipeline:
             },
             'prediction': {
                 'targets': ['iops', 'throughput_kb'],
-                'predict_steps': 2,
+                'predict_steps': 12,
             },
         }
 

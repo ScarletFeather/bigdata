@@ -207,28 +207,28 @@ class TimeSeriesPredictor:
         for i in range(1, n_lags + 1):
             df[f'target_lag_{i}'] = target_series.shift(i).values
 
-        # 滑动统计
+        # 滑动统计（shift(1) 确保只用历史数据，避免数据泄露）
         for w in [2, 3, 5]:
             if len(df) >= w:
-                df[f'rolling_mean_{w}'] = target_series.rolling(window=w, min_periods=1).mean().values
-                df[f'rolling_std_{w}'] = target_series.rolling(window=w, min_periods=1).std().fillna(0).values
-                df[f'rolling_min_{w}'] = target_series.rolling(window=w, min_periods=1).min().values
-                df[f'rolling_max_{w}'] = target_series.rolling(window=w, min_periods=1).max().values
+                df[f'rolling_mean_{w}'] = target_series.rolling(window=w, min_periods=1).mean().shift(1).values
+                df[f'rolling_std_{w}'] = target_series.rolling(window=w, min_periods=1).std().shift(1).fillna(0).values
+                df[f'rolling_min_{w}'] = target_series.rolling(window=w, min_periods=1).min().shift(1).values
+                df[f'rolling_max_{w}'] = target_series.rolling(window=w, min_periods=1).max().shift(1).values
 
-        # 差分特征（变化量）
-        df['diff_1'] = target_series.diff().fillna(0).values
-        df['diff_2'] = target_series.diff(2).fillna(0).values
+        # 差分特征（shift(1) 确保不使用当前值计算差分）
+        df['diff_1'] = target_series.diff().shift(1).fillna(0).values
+        df['diff_2'] = target_series.diff(2).shift(1).fillna(0).values
 
-        # 变化率（相对变化）
+        # 变化率（shift(1) 避免使用当前值）
         with np.errstate(divide='ignore', invalid='ignore'):
-            rate = (target_series.diff() / target_series.shift(1).replace(0, np.nan)).fillna(0)
+            rate = (target_series.diff().shift(1) / target_series.shift(1).replace(0, np.nan)).fillna(0)
             df['pct_change'] = rate.values
 
-        # EWM（指数加权滑动平均）
+        # EWM（shift(1) 确保只用历史数据）
         for span in [3, 5]:
-            df[f'ewm_{span}'] = target_series.ewm(span=span, adjust=False).mean().values
+            df[f'ewm_{span}'] = target_series.ewm(span=span, adjust=False).mean().shift(1).values
 
-        # 趋势强度（线性拟合斜率）
+        # 趋势强度（只用历史窗口 [i-3, i)，不含当前值）
         def trend_strength(s):
             if len(s) < 3:
                 return 0.0
@@ -238,10 +238,10 @@ class TimeSeriesPredictor:
         if len(df) >= 3:
             trend_vals = []
             for i in range(len(df)):
-                if i < 2:
+                if i < 3:
                     trend_vals.append(0.0)
                 else:
-                    window_data = target_series.iloc[max(0, i-2):i+1].values
+                    window_data = target_series.iloc[max(0, i-3):i].values
                     trend_vals.append(trend_strength(window_data))
             df['trend_strength'] = trend_vals
 
@@ -371,23 +371,23 @@ class TimeSeriesPredictor:
 
             for w in [2, 3, 5]:
                 if f'rolling_mean_{w}' in feature_cols:
-                    win = y_arr[max(0, i - w + 1):i + 1]
+                    win = y_arr[max(0, i - w):i]  # 只用历史窗口，不含当前值
                     row[f'rolling_mean_{w}'] = np.mean(win) if len(win) > 0 else 0
                     row[f'rolling_std_{w}'] = np.std(win) if len(win) > 0 else 0
                     row[f'rolling_min_{w}'] = np.min(win) if len(win) > 0 else 0
                     row[f'rolling_max_{w}'] = np.max(win) if len(win) > 0 else 0
 
-            if 'diff_1' in feature_cols and i > 0:
-                row['diff_1'] = y_arr[i] - y_arr[i - 1]
-            if 'diff_2' in feature_cols and i > 1:
-                row['diff_2'] = y_arr[i] - y_arr[i - 2]
+            if 'diff_1' in feature_cols and i > 1:
+                row['diff_1'] = y_arr[i - 1] - y_arr[i - 2]
+            if 'diff_2' in feature_cols and i > 2:
+                row['diff_2'] = y_arr[i - 1] - y_arr[i - 3]
 
-            if 'pct_change' in feature_cols and i > 0 and y_arr[i - 1] != 0:
-                row['pct_change'] = (y_arr[i] - y_arr[i - 1]) / y_arr[i - 1]
+            if 'pct_change' in feature_cols and i > 1 and y_arr[i - 2] != 0:
+                row['pct_change'] = (y_arr[i - 1] - y_arr[i - 2]) / y_arr[i - 2]
 
             for span in [3, 5]:
-                if f'ewm_{span}' in feature_cols:
-                    row[f'ewm_{span}'] = pd.Series(y_arr[:i + 1]).ewm(span=span, adjust=False).mean().iloc[-1]
+                if f'ewm_{span}' in feature_cols and i > 0:
+                    row[f'ewm_{span}'] = pd.Series(y_arr[:i]).ewm(span=span, adjust=False).mean().iloc[-1]
 
             row_vals = [row.get(c, 0) for c in feature_cols]
             rows.append(row_vals)
@@ -404,7 +404,7 @@ class TimeSeriesPredictor:
         使用多种模型训练并预测（递归多步）
 
         Args:
-            df_raw_io: 原始 I/O DataFrame（来自 parse_io_traces）
+            df_raw_io: 原始 I/O DataFrame（来自 parse_io_traces）或已聚合时间序列 DataFrame
             target_col: 预测目标
             model_names: 模型列表
             n_lags: 滞后阶数（自动选择）
@@ -414,15 +414,32 @@ class TimeSeriesPredictor:
         if n_lags is None:
             n_lags = 5
         if predict_steps is None:
-            predict_steps = 2
+            predict_steps = 12
         if model_names is None:
             model_names = self.MEDIUM_DATA_MODELS
 
-        logger.info(f"  选择时间窗口...")
-        window_sec, ts = self._select_best_window(df_raw_io, min_points=15)
+        # 检测数据类型：有 size/operation 列 = 原始 I/O trace，否则 = 已聚合时间序列
+        IS_PRE_AGGREGATED = ('size' not in df_raw_io.columns
+                             and 'operation' not in df_raw_io.columns
+                             and target_col in df_raw_io.columns
+                             and 'datetime' in df_raw_io.columns)
 
-        if target_col not in ts.columns:
-            raise ValueError(f"目标列 '{target_col}' 不在: {list(ts.columns)}")
+        if IS_PRE_AGGREGATED:
+            # 已聚合数据：直接用 datetime 作为索引
+            logger.info(f"  检测到已聚合时间序列数据，跳过窗口聚合")
+            ts = df_raw_io.copy()
+            if not isinstance(ts['datetime'].iloc[0], pd.Timestamp):
+                ts['datetime'] = pd.to_datetime(ts['datetime'])
+            window_sec = 'N/A'
+            ts = ts.set_index('datetime')
+            ts = ts[[target_col]].copy()
+            ts = ts[ts[target_col].notna()]
+        else:
+            logger.info(f"  选择时间窗口...")
+            window_sec, ts = self._select_best_window(df_raw_io, min_points=15)
+
+            if target_col not in ts.columns:
+                raise ValueError(f"目标列 '{target_col}' 不在: {list(ts.columns)}")
 
         # ---- 2. 自适应调整 n_lags ----
         n_lags = min(n_lags, max(2, len(ts) // 5))
@@ -434,7 +451,11 @@ class TimeSeriesPredictor:
                      f"数据点={len(ts)}")
 
         # ---- 3. 构建特征 ----
-        series = ts.set_index('datetime')[target_col]
+        if IS_PRE_AGGREGATED:
+            # ts 已经以 datetime 为索引，且仅包含目标列
+            series = ts[target_col]
+        else:
+            series = ts.set_index('datetime')[target_col]
         feature_df = pd.DataFrame(index=series.index)
         feature_df['target'] = series
 
@@ -581,7 +602,7 @@ class TimeSeriesPredictor:
         logger.info(f"可视化图表已保存至: {save_dir}")
 
     def _plot_prediction_comparison(self, all_results, save_dir):
-        """预测 vs 实际对比折线图"""
+        """预测 vs 实际对比折线图：上半=全局概览，下半=预测区放大（预测点均匀拉开）"""
         valid_results = {k: v for k, v in all_results.items() if 'models' in v}
         if not valid_results:
             return
@@ -606,94 +627,178 @@ class TimeSeriesPredictor:
         default_colors = plt.cm.tab10(np.linspace(0, 1, 10))
 
         n_targets = len(valid_results)
-        fig, axes = plt.subplots(n_targets, 1, figsize=(18, 6.5 * n_targets))
+        # 每个 target 两行: [0]=全局概览, [1]=预测区放大
+        fig, axes = plt.subplots(n_targets * 2, 1, figsize=(22, 8 * n_targets),
+                                 gridspec_kw={'height_ratios': [3, 2] * n_targets})
         if n_targets == 1:
-            axes = [axes]
+            axes = [axes[0], axes[1]]
 
-        for ax, (target, result) in zip(axes, valid_results.items()):
+        for ti, (target, result) in enumerate(valid_results.items()):
+            ax_full = axes[ti * 2]       # 全局概览
+            ax_zoom = axes[ti * 2 + 1]   # 预测区放大
+
             y_train = result['y_train']
             y_test = result['y_test']
             train_idx = result['train_index']
             test_idx = result['test_index']
             actual_test = y_test.values
 
-            # 历史负载（蓝色）
-            ax.plot(train_idx, y_train.values, '-', color='#2980b9', linewidth=1.8,
-                    alpha=0.7, label='历史负载', zorder=2)
-
-            # 预测区间实际值（黑色粗实线）
-            ax.plot(test_idx, actual_test, '-o', color='#2c3e50', linewidth=2.5,
-                    markersize=10, markerfacecolor='white', markeredgewidth=2,
-                    label='实际负载（预测区间）', zorder=5)
-
-            # 各模型预测线
             models_data = [(n, d) for n, d in result['models'].items() if 'predictions' in d]
+            n_pred_pts = len(test_idx)
+
+            # ========== 上半：全局概览 ==========
+            ax_full.plot(train_idx, y_train.values, '-', color='#1a5276', linewidth=2.0,
+                         alpha=0.9, label='历史负载', zorder=2)
+            ax_full.plot(test_idx, actual_test, '-o', color='#2c3e50', linewidth=2.8,
+                         markersize=10, markerfacecolor='white', markeredgewidth=2.2,
+                         label='实际负载', zorder=6)
+
             for i, (model_name, data) in enumerate(models_data):
-                pred = data['predictions']
                 style = model_styles.get(model_name, {})
                 color = style.get('color', default_colors[i % 10])
-                marker = style.get('marker', 'D')
-                ls = style.get('ls', '--')
                 m = data['metrics']
-                ax.plot(test_idx, pred, ls, color=color, linewidth=2.0,
-                        marker=marker, markersize=7, markeredgecolor=color,
-                        markerfacecolor='white', markeredgewidth=1.5,
-                        label=f'{model_name.replace("_", " ").title()} '
-                              f'(R2={m["R2"]:.3f}, MAPE={m["MAPE"]:.1f}%)',
-                        zorder=4)
+                ax_full.plot(test_idx, data['predictions'], style.get('ls', '--'),
+                             color=color, linewidth=2.4,
+                             marker=style.get('marker', 'D'), markersize=8,
+                             markeredgecolor=color, markerfacecolor='white',
+                             markeredgewidth=1.5,
+                             label=f'{model_name.replace("_"," ").title()} '
+                                   f'(R2={m["R2"]:.3f},MAPE={m["MAPE"]:.1f}%)',
+                             zorder=5)
+
+            if n_pred_pts > 0:
+                ax_full.axvline(x=test_idx[0], color='#e74c3c', linestyle='-', linewidth=2.0, alpha=0.7)
+                ax_full.axvspan(test_idx[0], test_idx[-1], alpha=0.08, color='#f39c12', zorder=0)
+
+            ylabel = target_labels.get(target, target)
+            ax_full.set_title(f'{ylabel} — 全局概览 (预测{n_pred_pts}步)',
+                              fontsize=15, fontweight='bold')
+            ax_full.set_ylabel(ylabel, fontsize=11)
+            ax_full.legend(fontsize=8, loc='upper left', framealpha=0.92, ncol=2)
+            ax_full.grid(True, alpha=0.2, linestyle='--')
+            ax_full.set_facecolor('#f8f9fa')
+            ax_full.tick_params(labelbottom=True)
+            # 时间轴格式化
+            if isinstance(train_idx, pd.DatetimeIndex):
+                ax_full.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            ax_full.tick_params(axis='x', rotation=30, labelsize=9)
+
+            # ========== 下半：预测区放大（等间距 ordinal x） ==========
+            # 取最后 50 个历史点 + 全部预测点，用 0,1,2,... 做 x 坐标均匀间隔
+            zoom_hist_n = min(50, len(y_train))
+            zoom_hist_vals = list(y_train.values[-zoom_hist_n:])
+
+            # 时间标签
+            if isinstance(train_idx, pd.DatetimeIndex):
+                zoom_hist_labels = [t.strftime('%H:%M') for t in train_idx[-zoom_hist_n:]]
+                zoom_test_labels = [t.strftime('%H:%M') for t in test_idx]
+            else:
+                zoom_hist_labels = [str(t)[-8:] for t in train_idx[-zoom_hist_n:]]
+                zoom_test_labels = [str(t)[-8:] for t in test_idx]
+
+            n_zoom = zoom_hist_n + n_pred_pts
+            x_zoom = np.arange(n_zoom)
+
+            # 历史尾巴
+            x_hist = x_zoom[:zoom_hist_n]
+            ax_zoom.plot(x_hist, zoom_hist_vals, '-', color='#1a5276', linewidth=2.0,
+                         alpha=0.85, zorder=2)
+
+            # 实际负载（预测区）
+            x_pred = x_zoom[zoom_hist_n:]
+            ax_zoom.plot(x_pred, actual_test, '-o', color='#2c3e50', linewidth=3.2,
+                         markersize=12, markerfacecolor='white', markeredgewidth=2.8,
+                         label='实际负载', zorder=6)
+
+            # 各模型预测线
+            for i, (model_name, data) in enumerate(models_data):
+                style = model_styles.get(model_name, {})
+                color = style.get('color', default_colors[i % 10])
+                m = data['metrics']
+                ax_zoom.plot(x_pred, data['predictions'],
+                             style.get('ls', '--'), color=color, linewidth=3.0,
+                             marker=style.get('marker', 'D'), markersize=11,
+                             markeredgecolor=color, markerfacecolor='white',
+                             markeredgewidth=2.2,
+                             label=f'{model_name.replace("_"," ").title()} '
+                                   f'(R2={m["R2"]:.3f},MAPE={m["MAPE"]:.1f}%)',
+                             zorder=5)
 
             # 分界线
-            if len(test_idx) > 0:
-                boundary = test_idx[0]
-                ax.axvline(x=boundary, color='#95a5a6', linestyle=':', linewidth=1.5, alpha=0.8)
-                y_max = max(y_train.max(), actual_test.max()) * 1.05
-                ax.text(boundary, y_max * 0.93, '  训练 | 预测  ',
-                        fontsize=10, color='#7f8c8d', fontweight='bold',
-                        ha='left', va='top',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#ecf0f1',
-                                  edgecolor='#bdc3c7', alpha=0.9))
+            if zoom_hist_n > 0:
+                ax_zoom.axvline(x=zoom_hist_n - 0.5, color='#e74c3c', linestyle='-',
+                                linewidth=2.5, alpha=0.8)
+                ax_zoom.axvspan(zoom_hist_n - 0.5, n_zoom - 0.5, alpha=0.10,
+                                color='#f39c12', zorder=0)
 
             # 最佳模型偏差填充
             if models_data:
                 best = min(models_data, key=lambda x: x[1]['metrics']['RMSE'])
-                best_pred = best[1]['predictions']
-                ax.fill_between(test_idx, actual_test, best_pred,
-                                alpha=0.12, color='#27ae60', zorder=1)
+                ax_zoom.fill_between(x_pred, actual_test, best[1]['predictions'],
+                                     alpha=0.15, color='#27ae60', zorder=1)
 
-            # 数值标注
-            for j, (idx_val, actual_val) in enumerate(zip(test_idx, actual_test)):
-                ax.annotate(f'{actual_val:.1f}', (idx_val, actual_val),
-                            textcoords="offset points", xytext=(0, 14),
-                            ha='center', fontsize=9, fontweight='bold', color='#2c3e50',
-                            bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                                      edgecolor='#2c3e50', alpha=0.85))
+            # X 轴刻度标签
+            all_labels = zoom_hist_labels + zoom_test_labels
+            # 历史段抽稀，预测段全标
+            tick_positions = []
+            tick_labels = []
+            if zoom_hist_n > 0:
+                hist_step = max(1, zoom_hist_n // 6)
+                for p in range(0, zoom_hist_n, hist_step):
+                    tick_positions.append(p)
+                    tick_labels.append(all_labels[p])
+            for p in range(n_pred_pts):
+                tick_positions.append(zoom_hist_n + p)
+                tick_labels.append(all_labels[zoom_hist_n + p])
+
+            ax_zoom.set_xticks(tick_positions)
+            ax_zoom.set_xticklabels(tick_labels, rotation=40, ha='right', fontsize=9)
+
+            # 数值标注（预测段每个点都标）
+            for j in range(n_pred_pts):
+                xv, av = x_pred[j], actual_test[j]
+                ax_zoom.annotate(f'{av:.1f}', (xv, av),
+                                 textcoords="offset points", xytext=(0, 16),
+                                 ha='center', fontsize=10, fontweight='bold',
+                                 color='#2c3e50',
+                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                                           edgecolor='#2c3e50', alpha=0.9))
                 for k, (model_name, data) in enumerate(models_data):
-                    pred_val = data['predictions'][j]
+                    pv = data['predictions'][j]
                     style = model_styles.get(model_name, {})
                     color = style.get('color', default_colors[k % 10])
-                    offset_x = (k - len(models_data) / 2 + 0.5) * 25
-                    ax.annotate(f'{pred_val:.1f}', (idx_val, pred_val),
-                                textcoords="offset points",
-                                xytext=(offset_x, -18 - (k % 2) * 12),
-                                ha='center', fontsize=7, color=color, fontweight='bold')
+                    ox = (k - len(models_data) / 2 + 0.5) * 35
+                    ax_zoom.annotate(f'{pv:.1f}', (xv, pv),
+                                     textcoords="offset points",
+                                     xytext=(ox, -20 - (k % 2) * 16),
+                                     ha='center', fontsize=8, color=color,
+                                     fontweight='bold')
 
-            ylabel = target_labels.get(target, target)
-            ax.set_title(f'{ylabel} — 历史负载 + 预测对比 (窗口 {result.get("window_seconds", "?")}s)',
-                         fontsize=15, fontweight='bold')
-            ax.set_xlabel('时间', fontsize=12)
-            ax.set_ylabel(ylabel, fontsize=12)
-            ax.legend(fontsize=8.5, loc='upper left', framealpha=0.9, ncol=2)
-            ax.grid(True, alpha=0.25, linestyle='--')
-            ax.set_facecolor('#fafafa')
+            ax_zoom.set_title(f'预测区放大 — 等间距展示 {n_pred_pts} 个预测步',
+                              fontsize=14, fontweight='bold', color='#c0392b')
+            ax_zoom.set_xlabel('时间（预测区展开）', fontsize=11)
+            ax_zoom.set_ylabel(ylabel, fontsize=11)
+            ax_zoom.legend(fontsize=8.5, loc='upper left', framealpha=0.93, ncol=2)
+            ax_zoom.grid(True, alpha=0.25, linestyle='--')
+            ax_zoom.set_facecolor('#fffef5')
 
-            all_vals = list(y_train.values) + list(actual_test)
+            # Y 轴范围（基于 zoom 窗口数据）
+            all_zv = list(zoom_hist_vals) + list(actual_test)
             for _, d in models_data:
-                all_vals += list(d['predictions'])
-            y_lo, y_hi = min(all_vals), max(all_vals)
-            margin = (y_hi - y_lo) * 0.15 if y_hi != y_lo else 1
-            ax.set_ylim(y_lo - margin, y_hi + margin * 2.5)
+                all_zv += list(d['predictions'])
+            z_lo, z_hi = min(all_zv), max(all_zv)
+            zm = (z_hi - z_lo) * 0.18 if z_hi != z_lo else 1
+            ax_zoom.set_ylim(z_lo - zm, z_hi + zm * 2.5)
 
-        plt.tight_layout(pad=2.0)
+            # 全局 Y 轴也同步
+            all_v = list(y_train.values) + list(actual_test)
+            for _, d in models_data:
+                all_v += list(d['predictions'])
+            y_lo, y_hi = min(all_v), max(all_v)
+            m = (y_hi - y_lo) * 0.15 if y_hi != y_lo else 1
+            ax_full.set_ylim(y_lo - m, y_hi + m * 2.8)
+
+        plt.tight_layout(pad=3.0)
         filepath = os.path.join(save_dir, 'prediction_comparison.png')
         fig.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
@@ -761,10 +866,11 @@ class TimeSeriesPredictor:
                 mape_labels.append(f"{mn}\n({target})")
 
         if residuals_all:
-            bp = axes[0].boxplot(residuals_all, labels=labels, patch_artist=True, showmeans=True)
+            bp = axes[0].boxplot(residuals_all, patch_artist=True, showmeans=True)
             colors = plt.cm.Pastel1(np.linspace(0, 1, len(residuals_all)))
             for p, c in zip(bp['boxes'], colors):
                 p.set_facecolor(c)
+            axes[0].set_xticklabels(labels, fontsize=7, rotation=30, ha='right')
             axes[0].axhline(y=0, color='red', linestyle='--', alpha=0.7)
             axes[0].set_title('残差分布 (预测 - 实际)', fontsize=13, fontweight='bold')
             axes[0].set_ylabel('残差', fontsize=12)
@@ -836,7 +942,7 @@ class TimeSeriesPredictor:
         logger.info(f"  保存: {filepath}")
 
     def _plot_dashboard(self, all_results, save_dir):
-        """综合仪表盘"""
+        """综合仪表盘（含预测区放大面板）"""
         valid_results = {k: v for k, v in all_results.items() if 'models' in v}
         if not valid_results:
             return
@@ -846,18 +952,11 @@ class TimeSeriesPredictor:
             'throughput_kb': '吞吐量 (KB/s)',
         }
 
-        fig = plt.figure(figsize=(22, 16))
+        fig = plt.figure(figsize=(24, 20))
         fig.suptitle('I/O 负载预测分析仪表盘 v2', fontsize=20, fontweight='bold', y=0.99)
 
-        gs = fig.add_gridspec(4, 3, hspace=0.40, wspace=0.35, height_ratios=[1.3, 1, 1, 0.8])
-
-        # ---- 顶部：完整历史 + 预测折线图 ----
-        ax_main = fig.add_subplot(gs[0, :])
-        target = list(valid_results.keys())[0]
-        result = valid_results[target]
-        y_train, y_test = result['y_train'], result['y_test']
-        train_idx, test_idx = result['train_index'], result['test_index']
-        actual = y_test.values
+        gs = fig.add_gridspec(5, 3, hspace=0.45, wspace=0.35,
+                              height_ratios=[1.1, 0.9, 0.9, 0.9, 0.7])
 
         model_styles_dash = {
             'linear': '#e74c3c', 'ridge': '#3498db', 'lasso': '#9b59b6',
@@ -865,47 +964,140 @@ class TimeSeriesPredictor:
             'exp_smoothing': '#1abc9c', 'ar1': '#e91e63', 'trend': '#00bcd4',
         }
 
-        ax_main.plot(train_idx, y_train.values, '-', color='#2980b9', linewidth=1.8,
-                     alpha=0.7, label='历史负载')
-        ax_main.plot(test_idx, actual, '-o', color='#2c3e50', linewidth=2.5,
-                     markersize=10, markerfacecolor='white', markeredgewidth=2,
-                     label='实际负载', zorder=5)
+        target = list(valid_results.keys())[0]
+        result = valid_results[target]
+        y_train, y_test = result['y_train'], result['y_test']
+        train_idx, test_idx = result['train_index'], result['test_index']
+        actual = y_test.values
+        models_data_dash = [(mn, d) for mn, d in result['models'].items()
+                            if 'predictions' in d]
 
-        for mn, data in result['models'].items():
-            if 'predictions' not in data:
-                continue
+        # ---- Row 0：全局概览 ----
+        ax_main = fig.add_subplot(gs[0, :])
+        ax_main.plot(train_idx, y_train.values, '-', color='#1a5276', linewidth=2.0,
+                     alpha=0.9, label='历史负载', zorder=2)
+        ax_main.plot(test_idx, actual, '-o', color='#2c3e50', linewidth=2.8,
+                     markersize=10, markerfacecolor='white', markeredgewidth=2.2,
+                     label='实际负载', zorder=6)
+
+        for mn, data in models_data_dash:
             color = model_styles_dash.get(mn, '#999')
             m = data['metrics']
-            ax_main.plot(test_idx, data['predictions'], '--',
-                         color=color, linewidth=2.0,
-                         marker='D', markersize=7, markeredgecolor=color,
+            ax_main.plot(test_idx, data['predictions'], '--', color=color, linewidth=2.4,
+                         marker='D', markersize=8, markeredgecolor=color,
                          markerfacecolor='white', markeredgewidth=1.5,
                          label=f"{mn.replace('_',' ').title()} "
-                               f"(Acc={m['Accuracy']:.0f}%, R2={m['R2']:.3f})",
-                         zorder=4)
+                               f"(Acc={m['Accuracy']:.0f}%,R2={m['R2']:.3f})", zorder=5)
 
-        ax_main.axvline(x=test_idx[0], color='#95a5a6', linestyle=':', linewidth=1.5)
-        ax_main.fill_between(test_idx, actual,
-                             result['models'][min(result['models'], key=lambda x: result['models'][x]['metrics']['RMSE'] if 'metrics' in result['models'][x] else float('inf'))]['predictions'],
-                             alpha=0.10, color='#27ae60')
+        ax_main.axvline(x=test_idx[0], color='#e74c3c', linestyle='-', linewidth=2.0, alpha=0.7)
+        ax_main.axvspan(test_idx[0], test_idx[-1], alpha=0.08, color='#f39c12', zorder=0)
 
-        for j, (idx_val, actual_val) in enumerate(zip(test_idx, actual)):
-            ax_main.annotate(f'{actual_val:.1f}', (idx_val, actual_val),
-                             textcoords="offset points", xytext=(0, 14),
-                             ha='center', fontsize=9, fontweight='bold', color='#2c3e50',
-                             bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                                       edgecolor='#2c3e50', alpha=0.85))
+        best_mk = min((k for k in result['models'] if 'metrics' in result['models'][k]),
+                      key=lambda x: result['models'][x]['metrics']['RMSE'], default=None)
+        if best_mk:
+            ax_main.fill_between(test_idx, actual,
+                                 result['models'][best_mk]['predictions'],
+                                 alpha=0.12, color='#27ae60')
 
         ylabel = target_labels.get(target, target)
-        ax_main.set_title(f'时间序列预测 — {ylabel}', fontsize=14, fontweight='bold')
-        ax_main.set_xlabel('时间', fontsize=12)
-        ax_main.set_ylabel(ylabel, fontsize=12)
-        ax_main.legend(fontsize=9, loc='upper left', ncol=3, framealpha=0.9)
-        ax_main.grid(True, alpha=0.25, linestyle='--')
-        ax_main.set_facecolor('#fafafa')
+        ax_main.set_title(f'全局概览 — {ylabel} (预测{len(test_idx)}步)',
+                         fontsize=14, fontweight='bold')
+        ax_main.set_ylabel(ylabel, fontsize=11)
+        ax_main.legend(fontsize=7.5, loc='upper left', ncol=3, framealpha=0.92)
+        ax_main.grid(True, alpha=0.2, linestyle='--')
+        ax_main.set_facecolor('#f8f9fa')
+        ax_main.tick_params(labelbottom=True)
+        if isinstance(train_idx, pd.DatetimeIndex):
+            ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        ax_main.tick_params(axis='x', rotation=30, labelsize=9)
 
-        # ---- 指标表 ----
-        ax_table = fig.add_subplot(gs[1, :])
+        all_v = list(y_train.values) + list(actual)
+        for md in result['models'].values():
+            if 'predictions' in md:
+                all_v += list(md['predictions'])
+        y_lo, y_hi = min(all_v), max(all_v)
+        ym = (y_hi - y_lo) * 0.15 if y_hi != y_lo else 1
+        ax_main.set_ylim(y_lo - ym, y_hi + ym * 2.8)
+
+        # ---- Row 1：预测区放大（等间距 ordinal x） ----
+        ax_zoom = fig.add_subplot(gs[1, :])
+        zoom_hist_n = min(50, len(y_train))
+        zoom_hist_vals = list(y_train.values[-zoom_hist_n:])
+        n_zoom = zoom_hist_n + len(test_idx)
+        x_zoom = np.arange(n_zoom)
+        x_hist_z = x_zoom[:zoom_hist_n]
+        x_pred_z = x_zoom[zoom_hist_n:]
+
+        ax_zoom.plot(x_hist_z, zoom_hist_vals, '-', color='#1a5276', linewidth=2.0,
+                     alpha=0.85, zorder=2)
+        ax_zoom.plot(x_pred_z, actual, '-o', color='#2c3e50', linewidth=3.2,
+                     markersize=12, markerfacecolor='white', markeredgewidth=2.8,
+                     label='实际负载', zorder=6)
+
+        for mn, data in models_data_dash:
+            color = model_styles_dash.get(mn, '#999')
+            m = data['metrics']
+            ax_zoom.plot(x_pred_z, data['predictions'], '--', color=color, linewidth=3.0,
+                         marker='D', markersize=11, markeredgecolor=color,
+                         markerfacecolor='white', markeredgewidth=2.2,
+                         label=f"{mn.replace('_',' ').title()} "
+                               f"(Acc={m['Accuracy']:.0f}%,R2={m['R2']:.3f})", zorder=5)
+
+        if zoom_hist_n > 0:
+            ax_zoom.axvline(x=zoom_hist_n - 0.5, color='#e74c3c', linestyle='-',
+                            linewidth=2.5, alpha=0.8)
+            ax_zoom.axvspan(zoom_hist_n - 0.5, n_zoom - 0.5, alpha=0.10,
+                            color='#f39c12', zorder=0)
+
+        if best_mk:
+            ax_zoom.fill_between(x_pred_z, actual,
+                                 result['models'][best_mk]['predictions'],
+                                 alpha=0.15, color='#27ae60', zorder=1)
+
+        # X 轴标签
+        all_labels_z = []
+        if isinstance(train_idx, pd.DatetimeIndex):
+            all_labels_z += [t.strftime('%H:%M') for t in train_idx[-zoom_hist_n:]]
+            all_labels_z += [t.strftime('%H:%M') for t in test_idx]
+        else:
+            all_labels_z += [str(t)[-8:] for t in train_idx[-zoom_hist_n:]]
+            all_labels_z += [str(t)[-8:] for t in test_idx]
+        tick_p, tick_l = [], []
+        if zoom_hist_n > 0:
+            for p in range(0, zoom_hist_n, max(1, zoom_hist_n // 6)):
+                tick_p.append(p); tick_l.append(all_labels_z[p])
+        for p in range(len(test_idx)):
+            tick_p.append(zoom_hist_n + p)
+            tick_l.append(all_labels_z[zoom_hist_n + p])
+        ax_zoom.set_xticks(tick_p)
+        ax_zoom.set_xticklabels(tick_l, rotation=40, ha='right', fontsize=9)
+
+        # 预测点数值标注（全标）
+        for j in range(len(test_idx)):
+            xv, av = x_pred_z[j], actual[j]
+            ax_zoom.annotate(f'{av:.1f}', (xv, av), textcoords="offset points",
+                             xytext=(0, 16), ha='center', fontsize=10, fontweight='bold',
+                             color='#2c3e50',
+                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                                       edgecolor='#2c3e50', alpha=0.9))
+
+        ax_zoom.set_title(f'预测区放大 — {len(test_idx)} 步等间距展开',
+                         fontsize=13, fontweight='bold', color='#c0392b')
+        ax_zoom.set_xlabel('时间（预测区展开）', fontsize=11)
+        ax_zoom.set_ylabel(ylabel, fontsize=11)
+        ax_zoom.legend(fontsize=8, loc='upper left', ncol=3, framealpha=0.93)
+        ax_zoom.grid(True, alpha=0.25, linestyle='--')
+        ax_zoom.set_facecolor('#fffef5')
+
+        zall = zoom_hist_vals + list(actual)
+        for _, d in models_data_dash:
+            zall += list(d['predictions'])
+        zl, zh = min(zall), max(zall)
+        zm2 = (zh - zl) * 0.18 if zh != zl else 1
+        ax_zoom.set_ylim(zl - zm2, zh + zm2 * 2.5)
+
+        # ---- Row 2：指标表 ----
+        ax_table = fig.add_subplot(gs[2, :])
         ax_table.axis('off')
         table_data = []
         for tgt, res in valid_results.items():
@@ -936,8 +1128,8 @@ class TimeSeriesPredictor:
                 table[0, j].set_text_props(color='white', fontweight='bold')
         ax_table.set_title('回归分析结果汇总', fontsize=12, fontweight='bold')
 
-        # ---- MAPE 对比 ----
-        ax_mape = fig.add_subplot(gs[2, 0])
+        # ---- Row 3：MAPE / R2 / Acc ----
+        ax_mape = fig.add_subplot(gs[3, 0])
         mape_data, mape_labels = [], []
         for tgt, res in valid_results.items():
             for mn, md in res['models'].items():
@@ -946,14 +1138,13 @@ class TimeSeriesPredictor:
                     mape_labels.append(f"{mn[:10]}\n({tgt[:8]})")
         if mape_data:
             colors_m = ['#27ae60' if v < 10 else '#f39c12' if v < 30 else '#e74c3c' for v in mape_data]
-            bars = ax_mape.barh(range(len(mape_data)), mape_data, color=colors_m)
+            ax_mape.barh(range(len(mape_data)), mape_data, color=colors_m)
             ax_mape.set_yticks(range(len(mape_labels)))
             ax_mape.set_yticklabels(mape_labels, fontsize=8)
             ax_mape.set_title('MAPE (%)', fontsize=12, fontweight='bold')
             ax_mape.grid(True, alpha=0.3, axis='x')
 
-        # ---- R2 柱状图 ----
-        ax_r2 = fig.add_subplot(gs[2, 1])
+        ax_r2 = fig.add_subplot(gs[3, 1])
         r2_data, r2_labels = [], []
         for tgt, res in valid_results.items():
             for mn, md in res['models'].items():
@@ -961,8 +1152,8 @@ class TimeSeriesPredictor:
                     r2_data.append(md['metrics']['R2'])
                     r2_labels.append(f"{mn[:10]}\n({tgt[:8]})")
         if r2_data:
-            bars = ax_r2.bar(range(len(r2_data)), r2_data,
-                             color=plt.cm.RdYlGn(np.clip(r2_data, 0, 1)))
+            ax_r2.bar(range(len(r2_data)), r2_data,
+                      color=plt.cm.RdYlGn(np.clip(r2_data, 0, 1)))
             ax_r2.set_xticks(range(len(r2_labels)))
             ax_r2.set_xticklabels(r2_labels, fontsize=7, rotation=30, ha='right')
             ax_r2.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='>=0.8 优秀')
@@ -972,8 +1163,7 @@ class TimeSeriesPredictor:
             ax_r2.legend(fontsize=8)
             ax_r2.grid(True, alpha=0.3, axis='y')
 
-        # ---- 准确率 ----
-        ax_acc = fig.add_subplot(gs[2, 2])
+        ax_acc = fig.add_subplot(gs[3, 2])
         acc_data, acc_labels = [], []
         for tgt, res in valid_results.items():
             for mn, md in res['models'].items():
@@ -983,7 +1173,7 @@ class TimeSeriesPredictor:
         if acc_data:
             colors_a = ['#27ae60' if v >= 90 else '#f39c12' if v >= 70 else '#e74c3c'
                         for v in acc_data]
-            bars = ax_acc.bar(range(len(acc_data)), acc_data, color=colors_a)
+            ax_acc.bar(range(len(acc_data)), acc_data, color=colors_a)
             ax_acc.set_xticks(range(len(acc_labels)))
             ax_acc.set_xticklabels(acc_labels, fontsize=7, rotation=30, ha='right')
             ax_acc.axhline(y=90, color='green', linestyle='--', alpha=0.5)

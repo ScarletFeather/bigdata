@@ -29,5 +29,10 @@
     "time_window": 60,
     "top_n_devices": 50,
     "hotspot_threshold": 10
+  },
+  "prediction": {
+    "targets": ["iops", "throughput_kb"],
+    "predict_steps": 12,
+    "n_lags": 8
   }
 }
